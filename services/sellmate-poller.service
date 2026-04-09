@@ -6,14 +6,12 @@ Wants=network-online.target vend-api.service
 [Service]
 Type=simple
 User=sambeals
-WorkingDirectory=/home/sambeals/sellmate
-ExecStart=/usr/bin/python3 /home/sambeals/sellmate/cloud_poller.py
-
-Restart=always
-RestartSec=2
+WorkingDirectory=/home/sambeals/sellmate-pi/app
 Environment=VEND_API_KEY=CHANGE_ME
 Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/sambeals/sellmate-pi/.venv/bin/python /home/sambeals/sellmate-pi/app/cloud_poller.py
+Restart=always
+RestartSec=2
 
 [Install]
 WantedBy=multi-user.target
-

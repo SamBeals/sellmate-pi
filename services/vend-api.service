@@ -6,9 +6,9 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=sambeals
-WorkingDirectory=/home/sambeals
+WorkingDirectory=/home/sambeals/sellmate-pi/app
 Environment=VEND_API_KEY=CHANGE_ME
-ExecStart=/home/sambeals/.venvs/vend-api/bin/uvicorn vend_api:app --host 0.0.0.0 --port 8000
+ExecStart=/home/sambeals/sellmate-pi/.venv/bin/uvicorn vend_api:app --host 0.0.0.0 --port 8000
 Restart=always
 RestartSec=2
 
