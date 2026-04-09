@@ -1,0 +1,16 @@
+[Unit]
+Description=SellMate Vend API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sambeals
+WorkingDirectory=/home/sambeals
+Environment=VEND_API_KEY=CHANGE_ME
+ExecStart=/home/sambeals/.venvs/vend-api/bin/uvicorn vend_api:app --host 0.0.0.0 --port 8000
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

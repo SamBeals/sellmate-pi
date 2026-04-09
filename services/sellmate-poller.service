@@ -1,0 +1,19 @@
+[Unit]
+Description=SellMate Pi Poller
+After=network-online.target vend-api.service
+Wants=network-online.target vend-api.service
+
+[Service]
+Type=simple
+User=sambeals
+WorkingDirectory=/home/sambeals/sellmate
+ExecStart=/usr/bin/python3 /home/sambeals/sellmate/cloud_poller.py
+
+Restart=always
+RestartSec=2
+Environment=VEND_API_KEY=CHANGE_ME
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
+

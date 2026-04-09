@@ -1,0 +1,19 @@
+[Unit]
+Description=SellMate Vend API (FastAPI)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sambeals
+WorkingDirectory=/home/sambeals/vend-ui
+ExecStart=/home/sambeals/vend-ui/.venv/bin/uvicorn vend_api:app --host 0.0.0.0 --port 8787
+Restart=always
+RestartSec=2
+
+# Optional but nice:
+# StandardOutput=journal
+# StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
