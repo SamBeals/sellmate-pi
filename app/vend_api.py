@@ -1,4 +1,3 @@
-
 import asyncio
 import os
 import subprocess
@@ -23,6 +22,7 @@ REG_ENABLE = os.getenv("REG_ENABLE", "0x00")
 BEAM_GPIO = int(os.getenv("BEAM_GPIO", "17"))
 BEAM_ACTIVE_STATE = int(os.getenv("BEAM_ACTIVE_STATE", "0"))  # 0 means beam break reads LOW
 BEAM_CLEAR_STATE = 1 if BEAM_ACTIVE_STATE == 0 else 0
+BEAM_DEBUG_LOGGING = os.getenv("BEAM_DEBUG_LOGGING", "false").lower() == "true"
 
 SLOT_TO_MASK: Dict[str, Dict[str, Any]] = {
     "S01": {"bank": "A", "mask": 1},
@@ -563,8 +563,8 @@ async def vend_mask_verified(
                 while asyncio.get_running_loop().time() < deadline:
                     current = beam_raw_state()
 
-                    raw = read_beam_raw()
-                    print(f"[BEAM] waiting: raw={raw}", flush=True)
+                    if BEAM_DEBUG_LOGGING:
+                        print(f"[BEAM] waiting: raw={current}", flush=True)
 
                     if current == BEAM_CLEAR_STATE:
                         saw_clear_after_start = True
@@ -725,4 +725,3 @@ async def vend_sequence(
             for s in req.steps
         ],
     }
-
