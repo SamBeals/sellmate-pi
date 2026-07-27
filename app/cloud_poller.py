@@ -3,6 +3,7 @@ import time
 import requests
 from typing import Any, Dict, List, Optional, Tuple
 
+
 CLOUD_BASE = os.getenv(
     "CLOUD_BASE",
     "https://sellmatecloud-1002770348452.us-west4.run.app",
@@ -18,11 +19,18 @@ LONG_POLL_SECONDS = int(os.getenv("LONG_POLL_SECONDS", "25"))
 DEFAULT_PULSE_SECONDS = float(os.getenv("DEFAULT_PULSE_SECONDS", "2.5"))
 DEFAULT_BEAM_WAIT_SECONDS = float(os.getenv("DEFAULT_BEAM_WAIT_SECONDS", "2.0"))
 DEFAULT_RETRY_ATTEMPTS = int(os.getenv("DEFAULT_RETRY_ATTEMPTS", "2"))
-DEFAULT_RETRY_GAP_SECONDS = float(os.getenv("DEFAULT_RETRY_GAP_SECONDS", "0.50"))
-DEFAULT_POST_PULSE_SETTLE_SECONDS = float(os.getenv("DEFAULT_POST_PULSE_SETTLE_SECONDS", "0.15"))
-REQUIRE_CLEAR_BEFORE_START = os.getenv("REQUIRE_CLEAR_BEFORE_START", "true").lower() == "true"
+DEFAULT_RETRY_GAP_SECONDS = float(
+    os.getenv("DEFAULT_RETRY_GAP_SECONDS", "0.50")
+)
+DEFAULT_POST_PULSE_SETTLE_SECONDS = float(
+    os.getenv("DEFAULT_POST_PULSE_SETTLE_SECONDS", "0.15")
+)
+REQUIRE_CLEAR_BEFORE_START = (
+    os.getenv("REQUIRE_CLEAR_BEFORE_START", "true").lower() == "true"
+)
 
 SESSION = requests.Session()
+
 
 SLOT_TO_HW: Dict[str, Dict[str, Any]] = {
     "S01": {"bank": "A", "mask": 1},
@@ -49,13 +57,20 @@ def pi_headers() -> Dict[str, str]:
 
 def claim_vend_job() -> Optional[Dict[str, Any]]:
     url = f"{CLOUD_BASE}/vend_jobs/claim"
+
     params = {
         "machine_id": MACHINE_ID,
         "wait_seconds": LONG_POLL_SECONDS,
     }
+
     timeout = (5, LONG_POLL_SECONDS + 10)
 
-    resp = SESSION.get(url, params=params, timeout=timeout)
+    resp = SESSION.get(
+        url,
+        params=params,
+        timeout=timeout,
+    )
+
     resp.raise_for_status()
 
     data = resp.json()
@@ -74,7 +89,9 @@ def slot_to_hw(slot_id: str) -> Dict[str, Any]:
     cfg = SLOT_TO_HW.get(sid)
 
     if cfg is None:
-        raise ValueError(f"Unknown slot_id '{slot_id}' in poller mapping")
+        raise ValueError(
+            f"Unknown slot_id '{slot_id}' in poller mapping"
+        )
 
     return {
         "slot_id": sid,
@@ -96,24 +113,38 @@ def normalize_items(job: Dict[str, Any]) -> List[Dict[str, Any]]:
         qty = int(item.get("qty", 1))
 
         if not slot_id:
-            raise ValueError(f"bad vend job item, missing slot_id: {item}")
+            raise ValueError(
+                f"bad vend job item, missing slot_id: {item}"
+            )
 
         if qty < 1:
-            raise ValueError(f"bad vend job item, qty must be >= 1: {item}")
+            raise ValueError(
+                f"bad vend job item, qty must be >= 1: {item}"
+            )
 
         hw = slot_to_hw(slot_id)
 
-        normalized.append({
-            "slot_id": hw["slot_id"],
-            "bank": hw["bank"],
-            "mask": hw["mask"],
-            "qty": qty,
-        })
+        normalized.append(
+            {
+                "slot_id": hw["slot_id"],
+                "bank": hw["bank"],
+                "mask": hw["mask"],
+                "qty": qty,
+            }
+        )
 
     return normalized
 
 
 def call_verified_vend(bank: str, mask: int) -> Dict[str, Any]:
+    """
+    Calls the production vend endpoint.
+
+    The endpoint name still includes "verified" for compatibility with the
+    existing cloud poller, but production vending currently does not require
+    beam verification. A response with {"ok": true} is considered successful.
+    """
+
     url = f"{PI_BASE}/vend_mask_verified"
 
     payload = {
@@ -133,9 +164,17 @@ def call_verified_vend(bank: str, mask: int) -> Dict[str, Any]:
         headers=pi_headers(),
         timeout=(5, 180),
     )
+
     resp.raise_for_status()
 
-    return resp.json()
+    data = resp.json()
+
+    if not isinstance(data, dict):
+        raise ValueError(
+            f"Pi vend API returned unexpected response: {data}"
+        )
+
+    return data
 
 
 def complete_vend_job(
@@ -156,20 +195,31 @@ def complete_vend_job(
     if error:
         payload["error"] = error
 
-    resp = SESSION.post(url, json=payload, timeout=(5, 60))
+    resp = SESSION.post(
+        url,
+        json=payload,
+        timeout=(5, 60),
+    )
+
     resp.raise_for_status()
 
     return resp.json()
 
 
-def execute_vend_job(job: Dict[str, Any]) -> Tuple[bool, Dict[str, Any], Optional[str]]:
+def execute_vend_job(
+    job: Dict[str, Any],
+) -> Tuple[bool, Dict[str, Any], Optional[str]]:
     vend_job_id = job.get("vend_job_id") or job.get("id") or "unknown"
     order_id = job.get("order_id") or "unknown"
     items = normalize_items(job)
 
     attempts_summary: List[Dict[str, Any]] = []
 
-    log(f"claimed vend_job={vend_job_id} order={order_id} item_count={len(items)}")
+    log(
+        f"claimed vend_job={vend_job_id} "
+        f"order={order_id} "
+        f"item_count={len(items)}"
+    )
 
     for item in items:
         slot_id = item["slot_id"]
@@ -178,21 +228,46 @@ def execute_vend_job(job: Dict[str, Any]) -> Tuple[bool, Dict[str, Any], Optiona
         qty = item["qty"]
 
         for unit_num in range(1, qty + 1):
-            vend_result = call_verified_vend(bank=bank, mask=mask)
+            vend_result = call_verified_vend(
+                bank=bank,
+                mask=mask,
+            )
 
-            attempts_summary.append({
-                "slot_id": slot_id,
-                "unit": unit_num,
-                "qty": qty,
-                "ok": vend_result.get("ok"),
-                "verified": vend_result.get("verified"),
-                "message": vend_result.get("message"),
-                "attempt_count": vend_result.get("attempt_count"),
-                "attempts": vend_result.get("attempts"),
-            })
+            vend_ok = bool(vend_result.get("ok"))
+            beam_verified = bool(
+                vend_result.get("verified", False)
+            )
 
-            if not vend_result.get("ok") or not vend_result.get("verified"):
-                error = vend_result.get("message") or f"Vend verification failed for {slot_id}"
+            attempts_summary.append(
+                {
+                    "slot_id": slot_id,
+                    "unit": unit_num,
+                    "qty": qty,
+                    "ok": vend_ok,
+                    "verified": beam_verified,
+                    "message": vend_result.get("message"),
+                    "attempt_count": vend_result.get(
+                        "attempt_count"
+                    ),
+                    "attempts": vend_result.get("attempts"),
+                }
+            )
+
+            log(
+                f"vend_job={vend_job_id} "
+                f"slot={slot_id} "
+                f"unit={unit_num}/{qty} "
+                f"ok={vend_ok} "
+                f"beam_verified={beam_verified}"
+            )
+
+            # Production vending currently does not require beam verification.
+            # Only the Pi API's "ok" result determines whether vending succeeded.
+            if not vend_ok:
+                error = (
+                    vend_result.get("message")
+                    or f"Vend failed for {slot_id}"
+                )
 
                 return (
                     False,
@@ -202,6 +277,7 @@ def execute_vend_job(job: Dict[str, Any]) -> Tuple[bool, Dict[str, Any], Optiona
                         "items": attempts_summary,
                         "failed_slot_id": slot_id,
                         "raw_result": vend_result,
+                        "beam_verification_required": False,
                     },
                     error,
                 )
@@ -212,6 +288,7 @@ def execute_vend_job(job: Dict[str, Any]) -> Tuple[bool, Dict[str, Any], Optiona
             "vend_job_id": vend_job_id,
             "order_id": order_id,
             "items": attempts_summary,
+            "beam_verification_required": False,
         },
         None,
     )
@@ -221,7 +298,9 @@ def handle_vend_job(job: Dict[str, Any]) -> None:
     vend_job_id = job.get("vend_job_id") or job.get("id")
 
     if not vend_job_id:
-        raise ValueError(f"vend job missing vend_job_id: {job}")
+        raise ValueError(
+            f"vend job missing vend_job_id: {job}"
+        )
 
     try:
         success, result, error = execute_vend_job(job)
@@ -230,14 +309,21 @@ def handle_vend_job(job: Dict[str, Any]) -> None:
             response = complete_vend_job(
                 vend_job_id=vend_job_id,
                 status="SUCCESS",
-                beam_verified=True,
+
+                # Beam verification is intentionally disabled in the current
+                # production flow. The vend succeeded based on the Pi API's
+                # "ok" response.
+                beam_verified=False,
+
                 result=result,
             )
 
             log(
                 f"vend_job={vend_job_id} SUCCESS; "
+                f"beam_verified=False; "
                 f"payment_action={response.get('payment_action')}"
             )
+
             return
 
         response = complete_vend_job(
@@ -245,7 +331,7 @@ def handle_vend_job(job: Dict[str, Any]) -> None:
             status="FAILED",
             beam_verified=False,
             result=result,
-            error=error or "Vend verification failed",
+            error=error or "Vend failed",
         )
 
         log(
@@ -260,24 +346,39 @@ def handle_vend_job(job: Dict[str, Any]) -> None:
                 vend_job_id=vend_job_id,
                 status="FAILED",
                 beam_verified=False,
-                result={"exception_type": type(e).__name__},
+                result={
+                    "exception_type": type(e).__name__,
+                    "beam_verification_required": False,
+                },
                 error=str(e),
             )
+
         except Exception as report_error:
             log(
-                f"vend_job={vend_job_id} local failure AND cloud report failed; "
-                f"local_error={e}; report_error={report_error}"
+                f"vend_job={vend_job_id} local failure AND "
+                f"cloud report failed; "
+                f"local_error={e}; "
+                f"report_error={report_error}"
             )
+
             return
 
-        log(f"vend_job={vend_job_id} FAILED; error={e}")
+        log(
+            f"vend_job={vend_job_id} FAILED; "
+            f"error={e}"
+        )
 
 
 def main() -> None:
     log(
-        f"starting; CLOUD_BASE={CLOUD_BASE} MACHINE_ID={MACHINE_ID} "
-        f"PI_BASE={PI_BASE} long_poll={LONG_POLL_SECONDS}s "
-        f"using X-API-Key={'(set)' if PI_API_KEY else '(empty)'}"
+        f"starting; "
+        f"CLOUD_BASE={CLOUD_BASE} "
+        f"MACHINE_ID={MACHINE_ID} "
+        f"PI_BASE={PI_BASE} "
+        f"long_poll={LONG_POLL_SECONDS}s "
+        f"using X-API-Key="
+        f"{'(set)' if PI_API_KEY else '(empty)'} "
+        f"beam_verification_required=False"
     )
 
     error_sleep = 2
@@ -294,12 +395,20 @@ def main() -> None:
             error_sleep = 2
 
         except requests.RequestException as e:
-            log(f"network/http error: {e}; retrying in {error_sleep}s")
+            log(
+                f"network/http error: {e}; "
+                f"retrying in {error_sleep}s"
+            )
+
             time.sleep(error_sleep)
             error_sleep = min(error_sleep * 2, 15)
 
         except Exception as e:
-            log(f"unexpected error: {e}; retrying in {error_sleep}s")
+            log(
+                f"unexpected error: {e}; "
+                f"retrying in {error_sleep}s"
+            )
+
             time.sleep(error_sleep)
             error_sleep = min(error_sleep * 2, 15)
 
