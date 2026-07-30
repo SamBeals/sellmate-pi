@@ -9,6 +9,13 @@ User=sambeals
 WorkingDirectory=/home/sambeals/sellmate-pi/app
 Environment=VEND_API_KEY=CHANGE_ME
 Environment=PYTHONUNBUFFERED=1
+# Must match vend-api.service. When true, poller requires verified ToF drop.
+Environment=TOF_VERIFICATION_ENABLED=false
+Environment=TOF_BASELINE_SECONDS=0.75
+Environment=TOF_WAIT_SECONDS=2.0
+Environment=TOF_DROP_THRESHOLD_CM=4.0
+Environment=TOF_CONSECUTIVE_HITS=2
+Environment=TOF_SAMPLE_INTERVAL_SECONDS=0.1
 ExecStart=/home/sambeals/sellmate-pi/.venv/bin/python /home/sambeals/sellmate-pi/app/cloud_poller.py
 Restart=always
 RestartSec=2

@@ -8,6 +8,13 @@ Type=simple
 User=sambeals
 WorkingDirectory=/home/sambeals/sellmate-pi/app
 Environment=VEND_API_KEY=CHANGE_ME
+# Set true only after VL53L1X is installed and drop threshold is calibrated.
+Environment=TOF_VERIFICATION_ENABLED=false
+Environment=TOF_BASELINE_SECONDS=0.75
+Environment=TOF_WAIT_SECONDS=2.0
+Environment=TOF_DROP_THRESHOLD_CM=4.0
+Environment=TOF_CONSECUTIVE_HITS=2
+Environment=TOF_SAMPLE_INTERVAL_SECONDS=0.1
 ExecStart=/home/sambeals/sellmate-pi/.venv/bin/uvicorn vend_api:app --host 0.0.0.0 --port 8000
 Restart=always
 RestartSec=2

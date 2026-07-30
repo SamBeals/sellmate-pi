@@ -16,9 +16,18 @@ PI_API_KEY = os.getenv("PI_API_KEY") or os.getenv("VEND_API_KEY", "")
 
 LONG_POLL_SECONDS = int(os.getenv("LONG_POLL_SECONDS", "25"))
 
+TOF_VERIFICATION_ENABLED = (
+    os.getenv("TOF_VERIFICATION_ENABLED", "false").lower() == "true"
+)
+
 DEFAULT_PULSE_SECONDS = float(os.getenv("DEFAULT_PULSE_SECONDS", "2.5"))
 DEFAULT_BEAM_WAIT_SECONDS = float(os.getenv("DEFAULT_BEAM_WAIT_SECONDS", "2.0"))
-DEFAULT_RETRY_ATTEMPTS = int(os.getenv("DEFAULT_RETRY_ATTEMPTS", "2"))
+DEFAULT_RETRY_ATTEMPTS = int(
+    os.getenv(
+        "DEFAULT_RETRY_ATTEMPTS",
+        "0" if TOF_VERIFICATION_ENABLED else "2",
+    )
+)
 DEFAULT_RETRY_GAP_SECONDS = float(
     os.getenv("DEFAULT_RETRY_GAP_SECONDS", "0.50")
 )
@@ -27,6 +36,16 @@ DEFAULT_POST_PULSE_SETTLE_SECONDS = float(
 )
 REQUIRE_CLEAR_BEFORE_START = (
     os.getenv("REQUIRE_CLEAR_BEFORE_START", "true").lower() == "true"
+)
+
+DEFAULT_TOF_WAIT_SECONDS = float(os.getenv("TOF_WAIT_SECONDS", "2.0"))
+DEFAULT_TOF_BASELINE_SECONDS = float(os.getenv("TOF_BASELINE_SECONDS", "0.75"))
+DEFAULT_TOF_DROP_THRESHOLD_CM = float(
+    os.getenv("TOF_DROP_THRESHOLD_CM", "4.0")
+)
+DEFAULT_TOF_CONSECUTIVE_HITS = int(os.getenv("TOF_CONSECUTIVE_HITS", "2"))
+DEFAULT_TOF_SAMPLE_INTERVAL_SECONDS = float(
+    os.getenv("TOF_SAMPLE_INTERVAL_SECONDS", "0.1")
 )
 
 SESSION = requests.Session()
@@ -140,29 +159,44 @@ def call_verified_vend(bank: str, mask: int) -> Dict[str, Any]:
     """
     Calls the production vend endpoint.
 
-    The endpoint name still includes "verified" for compatibility with the
-    existing cloud poller, but production vending currently does not require
-    beam verification. A response with {"ok": true} is considered successful.
+    When ToF verification is enabled on the Pi, success requires a verified
+    drop detection. When disabled, {"ok": true} after the motor pulse is enough.
     """
 
     url = f"{PI_BASE}/vend_mask_verified"
+
+    # Never retry motor pulses when ToF verification is on — duplicate vend risk.
+    retry_attempts = 0 if TOF_VERIFICATION_ENABLED else DEFAULT_RETRY_ATTEMPTS
 
     payload = {
         "bank": bank,
         "mask": mask,
         "pulse_seconds": DEFAULT_PULSE_SECONDS,
         "beam_wait_seconds": DEFAULT_BEAM_WAIT_SECONDS,
-        "retry_attempts": DEFAULT_RETRY_ATTEMPTS,
+        "retry_attempts": retry_attempts,
         "retry_gap_seconds": DEFAULT_RETRY_GAP_SECONDS,
         "post_pulse_settle_seconds": DEFAULT_POST_PULSE_SETTLE_SECONDS,
         "require_clear_before_start": REQUIRE_CLEAR_BEFORE_START,
+        "tof_wait_seconds": DEFAULT_TOF_WAIT_SECONDS,
+        "tof_baseline_seconds": DEFAULT_TOF_BASELINE_SECONDS,
+        "tof_drop_threshold_cm": DEFAULT_TOF_DROP_THRESHOLD_CM,
+        "tof_consecutive_hits": DEFAULT_TOF_CONSECUTIVE_HITS,
+        "tof_sample_interval_seconds": DEFAULT_TOF_SAMPLE_INTERVAL_SECONDS,
     }
+
+    # Baseline + pulse + wait can exceed the old 180s budget on slow paths.
+    timeout_seconds = (
+        DEFAULT_TOF_BASELINE_SECONDS
+        + DEFAULT_PULSE_SECONDS
+        + DEFAULT_TOF_WAIT_SECONDS
+        + 30
+    )
 
     resp = SESSION.post(
         url,
         json=payload,
         headers=pi_headers(),
-        timeout=(5, 180),
+        timeout=(5, max(180, timeout_seconds)),
     )
 
     resp.raise_for_status()
@@ -206,6 +240,15 @@ def complete_vend_job(
     return resp.json()
 
 
+def unit_succeeded(vend_result: Dict[str, Any]) -> bool:
+    ok = bool(vend_result.get("ok"))
+
+    if not TOF_VERIFICATION_ENABLED:
+        return ok
+
+    return ok and bool(vend_result.get("verified"))
+
+
 def execute_vend_job(
     job: Dict[str, Any],
 ) -> Tuple[bool, Dict[str, Any], Optional[str]]:
@@ -218,7 +261,8 @@ def execute_vend_job(
     log(
         f"claimed vend_job={vend_job_id} "
         f"order={order_id} "
-        f"item_count={len(items)}"
+        f"item_count={len(items)} "
+        f"tof_verification_enabled={TOF_VERIFICATION_ENABLED}"
     )
 
     for item in items:
@@ -228,27 +272,34 @@ def execute_vend_job(
         qty = item["qty"]
 
         for unit_num in range(1, qty + 1):
+            # Multi-qty: each unit gets a fresh per-vend ToF baseline inside
+            # the local API (collect → pulse → detect).
             vend_result = call_verified_vend(
                 bank=bank,
                 mask=mask,
             )
 
-            vend_ok = bool(vend_result.get("ok"))
-            beam_verified = bool(
-                vend_result.get("verified", False)
-            )
+            vend_ok = unit_succeeded(vend_result)
+            verified = bool(vend_result.get("verified", False))
 
             attempts_summary.append(
                 {
                     "slot_id": slot_id,
                     "unit": unit_num,
                     "qty": qty,
-                    "ok": vend_ok,
-                    "verified": beam_verified,
-                    "message": vend_result.get("message"),
-                    "attempt_count": vend_result.get(
-                        "attempt_count"
+                    "ok": bool(vend_result.get("ok")),
+                    "verified": verified,
+                    "motor_activated": vend_result.get("motor_activated"),
+                    "tof_detection": vend_result.get("tof_detection"),
+                    "verification_type": vend_result.get(
+                        "verification_type"
                     ),
+                    "baseline_cm": vend_result.get("baseline_cm"),
+                    "min_distance_cm": vend_result.get("min_distance_cm"),
+                    "drop_cm": vend_result.get("drop_cm"),
+                    "failure_reason": vend_result.get("failure_reason"),
+                    "message": vend_result.get("message"),
+                    "attempt_count": vend_result.get("attempt_count"),
                     "attempts": vend_result.get("attempts"),
                 }
             )
@@ -257,15 +308,15 @@ def execute_vend_job(
                 f"vend_job={vend_job_id} "
                 f"slot={slot_id} "
                 f"unit={unit_num}/{qty} "
-                f"ok={vend_ok} "
-                f"beam_verified={beam_verified}"
+                f"ok={vend_result.get('ok')} "
+                f"verified={verified} "
+                f"failure_reason={vend_result.get('failure_reason')}"
             )
 
-            # Production vending currently does not require beam verification.
-            # Only the Pi API's "ok" result determines whether vending succeeded.
             if not vend_ok:
                 error = (
                     vend_result.get("message")
+                    or vend_result.get("failure_reason")
                     or f"Vend failed for {slot_id}"
                 )
 
@@ -278,6 +329,10 @@ def execute_vend_job(
                         "failed_slot_id": slot_id,
                         "raw_result": vend_result,
                         "beam_verification_required": False,
+                        "tof_verification_required": TOF_VERIFICATION_ENABLED,
+                        "verification_type": (
+                            "tof" if TOF_VERIFICATION_ENABLED else "none"
+                        ),
                     },
                     error,
                 )
@@ -289,6 +344,10 @@ def execute_vend_job(
             "order_id": order_id,
             "items": attempts_summary,
             "beam_verification_required": False,
+            "tof_verification_required": TOF_VERIFICATION_ENABLED,
+            "verification_type": (
+                "tof" if TOF_VERIFICATION_ENABLED else "none"
+            ),
         },
         None,
     )
@@ -306,21 +365,20 @@ def handle_vend_job(job: Dict[str, Any]) -> None:
         success, result, error = execute_vend_job(job)
 
         if success:
+            # When ToF is enabled, success already required verified=true.
+            beam_verified = True if TOF_VERIFICATION_ENABLED else False
+
             response = complete_vend_job(
                 vend_job_id=vend_job_id,
                 status="SUCCESS",
-
-                # Beam verification is intentionally disabled in the current
-                # production flow. The vend succeeded based on the Pi API's
-                # "ok" response.
-                beam_verified=False,
-
+                beam_verified=beam_verified,
                 result=result,
             )
 
             log(
                 f"vend_job={vend_job_id} SUCCESS; "
-                f"beam_verified=False; "
+                f"beam_verified={beam_verified}; "
+                f"tof_verification_enabled={TOF_VERIFICATION_ENABLED}; "
                 f"payment_action={response.get('payment_action')}"
             )
 
@@ -349,6 +407,10 @@ def handle_vend_job(job: Dict[str, Any]) -> None:
                 result={
                     "exception_type": type(e).__name__,
                     "beam_verification_required": False,
+                    "tof_verification_required": TOF_VERIFICATION_ENABLED,
+                    "verification_type": (
+                        "tof" if TOF_VERIFICATION_ENABLED else "none"
+                    ),
                 },
                 error=str(e),
             )
@@ -378,7 +440,7 @@ def main() -> None:
         f"long_poll={LONG_POLL_SECONDS}s "
         f"using X-API-Key="
         f"{'(set)' if PI_API_KEY else '(empty)'} "
-        f"beam_verification_required=False"
+        f"tof_verification_enabled={TOF_VERIFICATION_ENABLED}"
     )
 
     error_sleep = 2

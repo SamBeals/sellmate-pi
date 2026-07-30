@@ -3,10 +3,14 @@
 # SellMate Vend API
 #
 # Current behavior:
-# - /vend_mask_verified performs the normal vend without beam checking.
-# - /vend_mask_verified_test contains the beam-verified test flow.
+# - /vend_mask_verified is the production poller endpoint.
+# - When TOF_VERIFICATION_ENABLED=true, production uses VL53L1X drop detection:
+#     per-vend median baseline (0.5–1.0s) → motor pulse → sudden distance decrease.
+# - When TOF_VERIFICATION_ENABLED=false, production pulses the motor only
+#   (legacy behavior; no drop verification).
+# - /vend_mask_verified_test contains the older IR beam-verified test flow.
 # - New beam sensors use HIGH / 1 for BROKEN and LOW / 0 for CLEAR.
-# - Beam GPIO initialization failure does not crash the API.
+# - Beam GPIO / ToF initialization failure does not crash the API.
 # - LED/light-manager initialization failure remains non-fatal.
 # - Startup I2C initialization failure does not prevent the API from starting.
 # - Hardware availability and initialization errors are exposed through /health.
@@ -26,7 +30,7 @@ from pydantic import BaseModel, Field, model_validator
 
 app = FastAPI(
     title="SellMate Vend API",
-    version="1.2.0",
+    version="1.3.0",
 )
 
 
@@ -50,6 +54,20 @@ BEAM_GPIO = int(os.getenv("BEAM_GPIO", "17"))
 # This can still be overridden through the environment later.
 BEAM_BROKEN_STATE = int(os.getenv("BEAM_BROKEN_STATE", "1"))
 BEAM_CLEAR_STATE = 0 if BEAM_BROKEN_STATE == 1 else 1
+
+# VL53L1X ToF verification (production path when enabled).
+TOF_VERIFICATION_ENABLED = (
+    os.getenv("TOF_VERIFICATION_ENABLED", "false").lower() == "true"
+)
+TOF_I2C_BUS = int(os.getenv("TOF_I2C_BUS", "1"))
+TOF_BASELINE_SECONDS = float(os.getenv("TOF_BASELINE_SECONDS", "0.75"))
+TOF_WAIT_SECONDS = float(os.getenv("TOF_WAIT_SECONDS", "2.0"))
+TOF_DROP_THRESHOLD_CM = float(os.getenv("TOF_DROP_THRESHOLD_CM", "4.0"))
+TOF_CONSECUTIVE_HITS = int(os.getenv("TOF_CONSECUTIVE_HITS", "2"))
+TOF_SAMPLE_INTERVAL_SECONDS = float(
+    os.getenv("TOF_SAMPLE_INTERVAL_SECONDS", "0.1")
+)
+TOF_MIN_BASELINE_SAMPLES = int(os.getenv("TOF_MIN_BASELINE_SAMPLES", "3"))
 
 API_KEY = os.getenv("VEND_API_KEY", "CHANGE_ME")
 
@@ -84,6 +102,10 @@ I2C_ERROR: Optional[str] = None
 
 LIGHTS_AVAILABLE = False
 LIGHTS_ERROR: Optional[str] = None
+
+TOF_SENSOR = None
+TOF_AVAILABLE = False
+TOF_ERROR: Optional[str] = None
 
 
 # =========================================================
@@ -186,6 +208,28 @@ class VendMaskVerifiedRequest(BaseModel):
         le=3.0,
     )
     require_clear_before_start: bool = Field(default=True)
+    # ToF additive fields (used when TOF_VERIFICATION_ENABLED=true).
+    tof_wait_seconds: float = Field(default=TOF_WAIT_SECONDS, ge=0.1, le=10.0)
+    tof_baseline_seconds: float = Field(
+        default=TOF_BASELINE_SECONDS,
+        ge=0.5,
+        le=1.0,
+    )
+    tof_drop_threshold_cm: float = Field(
+        default=TOF_DROP_THRESHOLD_CM,
+        ge=0.5,
+        le=50.0,
+    )
+    tof_consecutive_hits: int = Field(
+        default=TOF_CONSECUTIVE_HITS,
+        ge=1,
+        le=10,
+    )
+    tof_sample_interval_seconds: float = Field(
+        default=TOF_SAMPLE_INTERVAL_SECONDS,
+        ge=0.02,
+        le=1.0,
+    )
 
     @model_validator(mode="after")
     def validate_mask_single_bit(self):
@@ -635,6 +679,232 @@ async def wait_for_beam_break(
 
 
 # =========================================================
+# ToF (VL53L1X) helpers
+# =========================================================
+
+def init_tof_sensor() -> bool:
+    global TOF_SENSOR
+    global TOF_AVAILABLE
+    global TOF_ERROR
+
+    if not TOF_VERIFICATION_ENABLED:
+        TOF_SENSOR = None
+        TOF_AVAILABLE = False
+        TOF_ERROR = "ToF verification disabled"
+        print("[TOF] Verification disabled", flush=True)
+        return False
+
+    try:
+        from tof_sensor import TofSensor
+
+        sensor = TofSensor(i2c_bus=TOF_I2C_BUS)
+        if not sensor.initialize():
+            TOF_SENSOR = None
+            TOF_AVAILABLE = False
+            TOF_ERROR = sensor.error or "ToF init failed"
+            print(f"[TOF] Init failed: {TOF_ERROR}", flush=True)
+            return False
+
+        sensor.start_ranging()
+        TOF_SENSOR = sensor
+        TOF_AVAILABLE = True
+        TOF_ERROR = None
+        print(
+            f"[TOF] VL53L1X ready on I2C bus {TOF_I2C_BUS}",
+            flush=True,
+        )
+        return True
+
+    except Exception as e:
+        TOF_SENSOR = None
+        TOF_AVAILABLE = False
+        TOF_ERROR = str(e)
+        print(f"[TOF] Init exception: {e}", flush=True)
+        return False
+
+
+def ensure_tof_ready() -> None:
+    global TOF_AVAILABLE
+    global TOF_ERROR
+
+    if TOF_AVAILABLE and TOF_SENSOR is not None:
+        return
+
+    if not init_tof_sensor():
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "message": "ToF sensor is unavailable.",
+                "error": TOF_ERROR,
+                "i2c_bus": TOF_I2C_BUS,
+                "verification_type": "tof",
+            },
+        )
+
+
+async def _vend_with_tof_verification(
+    req: VendMaskVerifiedRequest,
+) -> Dict[str, Any]:
+    """
+    Per-vend median baseline → motor pulse → sudden distance decrease.
+    Motor retries are disabled to avoid duplicate dispenses.
+    """
+    ensure_tof_ready()
+    ensure_i2c_ready()
+    assert TOF_SENSOR is not None
+
+    set_light_state_safe(STATE_PAYMENT_AUTHORIZED)
+
+    baseline_cm = await asyncio.to_thread(
+        TOF_SENSOR.collect_baseline_cm,
+        req.tof_baseline_seconds,
+        req.tof_sample_interval_seconds,
+        TOF_MIN_BASELINE_SAMPLES,
+    )
+
+    if baseline_cm is None:
+        set_light_state_safe(STATE_IDLE)
+        return {
+            "ok": False,
+            "mode": "vend_mask_verified",
+            "bank": req.bank.upper(),
+            "mask": hex(req.mask),
+            "verified": False,
+            "motor_activated": False,
+            "tof_detection": False,
+            "verification_type": "tof",
+            "sensor": "VL53L1X",
+            "failure_reason": "sensor_unavailable",
+            "message": (
+                "Could not collect a valid ToF baseline before vend. "
+                "No motor pulse was started."
+            ),
+            "attempt_count": 0,
+            "max_attempts": 1,
+            "pulse_seconds": req.pulse_seconds,
+            "tof_baseline_seconds": req.tof_baseline_seconds,
+            "tof_wait_seconds": req.tof_wait_seconds,
+        }
+
+    monitor_seconds = req.pulse_seconds + req.tof_wait_seconds
+    monitor_task = asyncio.create_task(
+        asyncio.to_thread(
+            TOF_SENSOR.monitor_sudden_decrease,
+            baseline_cm,
+            monitor_seconds,
+            req.tof_drop_threshold_cm,
+            req.tof_consecutive_hits,
+            req.tof_sample_interval_seconds,
+        )
+    )
+
+    motor_activated = False
+
+    try:
+        await _pulse_mask_once(
+            req.bank,
+            req.mask,
+            req.pulse_seconds,
+        )
+        motor_activated = True
+
+        if req.post_pulse_settle_seconds > 0:
+            await asyncio.sleep(req.post_pulse_settle_seconds)
+
+        detection = await monitor_task
+
+    except Exception:
+        if not monitor_task.done():
+            monitor_task.cancel()
+            try:
+                await monitor_task
+            except Exception:
+                pass
+        raise
+
+    if detection.detected:
+        asyncio.create_task(
+            flash_light_state_then_idle(
+                STATE_VEND_SUCCESS,
+                seconds=3.0,
+            )
+        )
+
+        return {
+            "ok": True,
+            "mode": "vend_mask_verified",
+            "bank": req.bank.upper(),
+            "mask": hex(req.mask),
+            "verified": True,
+            "motor_activated": motor_activated,
+            "tof_detection": True,
+            "verification_type": "tof",
+            "sensor": "VL53L1X",
+            "baseline_cm": detection.baseline_cm,
+            "min_distance_cm": detection.min_distance_cm,
+            "drop_cm": detection.drop_cm,
+            "sample_count": detection.sample_count,
+            "attempt_count": 1,
+            "max_attempts": 1,
+            "message": "ToF drop verified.",
+            "attempts": [
+                {
+                    "attempt": 1,
+                    "motor_activated": True,
+                    "tof_detection": True,
+                    "baseline_cm": detection.baseline_cm,
+                    "min_distance_cm": detection.min_distance_cm,
+                    "drop_cm": detection.drop_cm,
+                }
+            ],
+            "pulse_seconds": req.pulse_seconds,
+            "tof_baseline_seconds": req.tof_baseline_seconds,
+            "tof_wait_seconds": req.tof_wait_seconds,
+            "tof_drop_threshold_cm": req.tof_drop_threshold_cm,
+        }
+
+    set_light_state_safe(STATE_IDLE)
+
+    return {
+        "ok": False,
+        "mode": "vend_mask_verified",
+        "bank": req.bank.upper(),
+        "mask": hex(req.mask),
+        "verified": False,
+        "motor_activated": motor_activated,
+        "tof_detection": False,
+        "verification_type": "tof",
+        "sensor": "VL53L1X",
+        "baseline_cm": detection.baseline_cm,
+        "min_distance_cm": detection.min_distance_cm,
+        "drop_cm": detection.drop_cm,
+        "sample_count": detection.sample_count,
+        "failure_reason": detection.failure_reason or "tof_timeout",
+        "attempt_count": 1,
+        "max_attempts": 1,
+        "message": (
+            "No ToF drop detected after motor pulse "
+            f"(baseline={detection.baseline_cm:.1f}cm, "
+            f"min={detection.min_distance_cm:.1f}cm)."
+        ),
+        "attempts": [
+            {
+                "attempt": 1,
+                "motor_activated": motor_activated,
+                "tof_detection": False,
+                "baseline_cm": detection.baseline_cm,
+                "min_distance_cm": detection.min_distance_cm,
+                "drop_cm": detection.drop_cm,
+            }
+        ],
+        "pulse_seconds": req.pulse_seconds,
+        "tof_baseline_seconds": req.tof_baseline_seconds,
+        "tof_wait_seconds": req.tof_wait_seconds,
+        "tof_drop_threshold_cm": req.tof_drop_threshold_cm,
+    }
+
+
+# =========================================================
 # Light helpers
 # =========================================================
 
@@ -676,9 +946,14 @@ async def flash_light_state_then_idle(
 @app.on_event("startup")
 def startup() -> None:
     print("[STARTUP] Starting SellMate Vend API", flush=True)
+    print(
+        f"[STARTUP] TOF_VERIFICATION_ENABLED={TOF_VERIFICATION_ENABLED}",
+        flush=True,
+    )
 
     init_mcp23017()
     init_beam_gpio()
+    init_tof_sensor()
     set_light_state_safe(STATE_IDLE)
 
     print(
@@ -690,6 +965,12 @@ def startup() -> None:
 @app.on_event("shutdown")
 def shutdown() -> None:
     clear_vend_outputs_safe()
+
+    if TOF_SENSOR is not None:
+        try:
+            TOF_SENSOR.stop_ranging()
+        except Exception:
+            pass
 
     if GPIO_IMPORTED and GPIO is not None:
         try:
@@ -731,6 +1012,17 @@ def health():
             "beam_clear_state": BEAM_CLEAR_STATE,
             "error": GPIO_ERROR,
         },
+        "tof": {
+            "verification_enabled": TOF_VERIFICATION_ENABLED,
+            "available": TOF_AVAILABLE,
+            "sensor": "VL53L1X",
+            "i2c_bus": TOF_I2C_BUS,
+            "baseline_seconds": TOF_BASELINE_SECONDS,
+            "drop_threshold_cm": TOF_DROP_THRESHOLD_CM,
+            "consecutive_hits": TOF_CONSECUTIVE_HITS,
+            "sample_interval_seconds": TOF_SAMPLE_INTERVAL_SECONDS,
+            "error": TOF_ERROR,
+        },
         "lights": {
             "available": LIGHTS_AVAILABLE,
             "error": LIGHTS_ERROR,
@@ -746,13 +1038,17 @@ def reinitialize_hardware(
 
     i2c_ok = init_mcp23017()
     gpio_ok = init_beam_gpio()
+    tof_ok = init_tof_sensor() if TOF_VERIFICATION_ENABLED else False
 
     return {
-        "ok": i2c_ok or gpio_ok,
+        "ok": i2c_ok or gpio_ok or tof_ok,
         "i2c_initialized": i2c_ok,
         "i2c_error": I2C_ERROR,
         "gpio_initialized": gpio_ok,
         "gpio_error": GPIO_ERROR,
+        "tof_initialized": tof_ok,
+        "tof_error": TOF_ERROR,
+        "tof_verification_enabled": TOF_VERIFICATION_ENABLED,
     }
 
 
@@ -907,10 +1203,35 @@ async def vend_mask_verified(
     """
     Production vending endpoint.
 
-    Beam checking is intentionally disabled for now. The motor is pulsed
-    once and the request succeeds when the pulse completes.
+    When TOF_VERIFICATION_ENABLED=true:
+      per-vend ToF baseline → motor pulse → sudden distance decrease required.
+
+    When disabled:
+      motor is pulsed once; request succeeds when the pulse completes
+      (legacy behavior; no drop verification).
     """
     _require_api_key(x_api_key)
+
+    if TOF_VERIFICATION_ENABLED:
+        async with _vend_lock:
+            try:
+                return await _vend_with_tof_verification(req)
+
+            except HTTPException:
+                set_light_state_safe(STATE_IDLE)
+                raise
+
+            except Exception as e:
+                set_light_state_safe(STATE_IDLE)
+                traceback.print_exc()
+
+                raise HTTPException(
+                    status_code=500,
+                    detail=str(e),
+                ) from e
+
+            finally:
+                clear_vend_outputs_safe()
 
     async with _vend_lock:
         try:
@@ -958,10 +1279,15 @@ async def vend_mask_verified(
         "beam_check_skipped": True,
         "beam_broken": None,
         "verified": False,
+        "motor_activated": True,
+        "tof_detection": False,
+        "verification_type": "none",
         "vend_completed": True,
         "attempt_count": 1,
         "max_attempts": 1,
-        "message": "Vend pulse completed. Beam verification is disabled.",
+        "message": (
+            "Vend pulse completed. ToF verification is disabled."
+        ),
         "attempts": [
             {
                 "attempt": 1,
