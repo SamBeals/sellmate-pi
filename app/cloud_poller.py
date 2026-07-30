@@ -14,7 +14,16 @@ PI_BASE = os.getenv("PI_BASE", "http://127.0.0.1:8000").rstrip("/")
 
 PI_API_KEY = os.getenv("PI_API_KEY") or os.getenv("VEND_API_KEY", "")
 
-LONG_POLL_SECONDS = int(os.getenv("LONG_POLL_SECONDS", "25"))
+# Short-poll: cloud returns immediately; Pi sleeps after empty claims.
+CLAIM_WAIT_SECONDS = int(os.getenv("CLAIM_WAIT_SECONDS", "0"))
+POLL_INTERVAL_SECONDS = float(os.getenv("POLL_INTERVAL_SECONDS", "5"))
+REQUEST_TIMEOUT_SECONDS = float(os.getenv("REQUEST_TIMEOUT_SECONDS", "10"))
+ERROR_BACKOFF_BASE_SECONDS = float(
+    os.getenv("ERROR_BACKOFF_BASE_SECONDS", "5")
+)
+ERROR_BACKOFF_MAX_SECONDS = float(
+    os.getenv("ERROR_BACKOFF_MAX_SECONDS", "60")
+)
 
 TOF_VERIFICATION_ENABLED = (
     os.getenv("TOF_VERIFICATION_ENABLED", "false").lower() == "true"
@@ -74,15 +83,25 @@ def pi_headers() -> Dict[str, str]:
     return headers
 
 
+def next_error_backoff_seconds(current_seconds: float) -> float:
+    """Exponential backoff: base → … → max (inclusive)."""
+    return min(current_seconds * 2, ERROR_BACKOFF_MAX_SECONDS)
+
+
 def claim_vend_job() -> Optional[Dict[str, Any]]:
+    """
+    Short-poll claim. Cloud must return immediately (wait_seconds=0).
+    Returns the job dict, or None when status is NO_JOB / empty.
+    """
     url = f"{CLOUD_BASE}/vend_jobs/claim"
 
     params = {
         "machine_id": MACHINE_ID,
-        "wait_seconds": LONG_POLL_SECONDS,
+        "wait_seconds": CLAIM_WAIT_SECONDS,
     }
 
-    timeout = (5, LONG_POLL_SECONDS + 10)
+    # (connect timeout, read timeout) — not derived from long-poll.
+    timeout = (5, REQUEST_TIMEOUT_SECONDS)
 
     resp = SESSION.get(
         url,
@@ -437,24 +456,31 @@ def main() -> None:
         f"CLOUD_BASE={CLOUD_BASE} "
         f"MACHINE_ID={MACHINE_ID} "
         f"PI_BASE={PI_BASE} "
-        f"long_poll={LONG_POLL_SECONDS}s "
+        f"poll_interval={POLL_INTERVAL_SECONDS}s "
+        f"claim_wait={CLAIM_WAIT_SECONDS}s "
+        f"request_timeout={REQUEST_TIMEOUT_SECONDS}s "
+        f"error_backoff_base={ERROR_BACKOFF_BASE_SECONDS}s "
+        f"error_backoff_max={ERROR_BACKOFF_MAX_SECONDS}s "
         f"using X-API-Key="
         f"{'(set)' if PI_API_KEY else '(empty)'} "
         f"tof_verification_enabled={TOF_VERIFICATION_ENABLED}"
     )
 
-    error_sleep = 2
+    error_sleep = ERROR_BACKOFF_BASE_SECONDS
 
     while True:
         try:
             job = claim_vend_job()
 
+            # Successful HTTP response (including NO_JOB) resets backoff.
+            error_sleep = ERROR_BACKOFF_BASE_SECONDS
+
             if job is None:
-                error_sleep = 2
+                time.sleep(POLL_INTERVAL_SECONDS)
                 continue
 
+            # Job claimed: vend + complete, then claim again immediately.
             handle_vend_job(job)
-            error_sleep = 2
 
         except requests.RequestException as e:
             log(
@@ -463,7 +489,7 @@ def main() -> None:
             )
 
             time.sleep(error_sleep)
-            error_sleep = min(error_sleep * 2, 15)
+            error_sleep = next_error_backoff_seconds(error_sleep)
 
         except Exception as e:
             log(
@@ -472,7 +498,7 @@ def main() -> None:
             )
 
             time.sleep(error_sleep)
-            error_sleep = min(error_sleep * 2, 15)
+            error_sleep = next_error_backoff_seconds(error_sleep)
 
 
 if __name__ == "__main__":

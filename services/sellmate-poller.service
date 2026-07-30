@@ -9,6 +9,12 @@ User=sambeals
 WorkingDirectory=/home/sambeals/sellmate-pi/app
 Environment=VEND_API_KEY=CHANGE_ME
 Environment=PYTHONUNBUFFERED=1
+# Short-poll: cloud returns immediately; Pi sleeps after NO_JOB.
+Environment=CLAIM_WAIT_SECONDS=0
+Environment=POLL_INTERVAL_SECONDS=5
+Environment=REQUEST_TIMEOUT_SECONDS=10
+Environment=ERROR_BACKOFF_BASE_SECONDS=5
+Environment=ERROR_BACKOFF_MAX_SECONDS=60
 # Must match vend-api.service. When true, poller requires verified ToF drop.
 Environment=TOF_VERIFICATION_ENABLED=false
 Environment=TOF_BASELINE_SECONDS=0.75

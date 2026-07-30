@@ -40,3 +40,5 @@ echo "  6. Enable ToF after calibration by setting TOF_VERIFICATION_ENABLED=true
 echo "     in both vend-api.service and sellmate-poller.service, then:"
 echo "       sudo systemctl daemon-reload"
 echo "       sudo systemctl restart vend-api sellmate-poller"
+echo "  7. Poller uses short-poll (CLAIM_WAIT_SECONDS=0, POLL_INTERVAL_SECONDS=5)."
+echo "     Do not set LONG_POLL_SECONDS; it is removed."
