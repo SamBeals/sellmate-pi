@@ -7,11 +7,9 @@ Wants=network-online.target
 Type=simple
 User=sambeals
 WorkingDirectory=/home/sambeals/sellmate-pi
+# Shared machine identity + cloud settings (MACHINE_ID required).
+EnvironmentFile=/etc/sellmate/machine.env
 Environment=PYTHONUNBUFFERED=1
-Environment=MACHINE_ID=machine_001
-Environment=CLOUD_BASE=https://sellmatecloud-1002770348452.us-west4.run.app
-# Must match SellMateCloud MACHINE_SHARED_TOKEN (Cloud Run secret/env).
-Environment=MACHINE_SHARED_TOKEN=CHANGE_ME
 Environment=HEALTH_INTERVAL_SECONDS=60
 Environment=HEALTH_JITTER_SECONDS=10
 Environment=HEALTH_HTTP_TIMEOUT_SECONDS=8

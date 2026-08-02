@@ -3,13 +3,13 @@ import time
 import requests
 from typing import Any, Dict, List, Optional, Tuple
 
+from config import MACHINE_ID
 
 CLOUD_BASE = os.getenv(
     "CLOUD_BASE",
     "https://sellmatecloud-1002770348452.us-west4.run.app",
 ).rstrip("/")
 
-MACHINE_ID = os.getenv("MACHINE_ID", "machine_001")
 PI_BASE = os.getenv("PI_BASE", "http://127.0.0.1:8000").rstrip("/")
 
 PI_API_KEY = os.getenv("PI_API_KEY") or os.getenv("VEND_API_KEY", "")

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import importlib
+import os
 import sys
 import types
 import unittest
@@ -36,9 +38,24 @@ def _ensure_requests_stub():
     sys.modules["requests"] = requests
 
 
-_ensure_requests_stub()
+def _load_health_reporter(machine_id: str = "machine_test"):
+    _ensure_requests_stub()
+    os.environ["MACHINE_ID"] = machine_id
+    for name in list(sys.modules):
+        if name in {"app.config", "config", "app.health_reporter", "app"} or name.startswith(
+            "app."
+        ):
+            # Keep other app modules if needed; purge config + health_reporter.
+            if name in {"app.config", "config", "app.health_reporter"} or name == "app":
+                sys.modules.pop(name, None)
+    # Ensure package import works
+    import app  # noqa: F401
 
-from app import health_reporter as hr  # noqa: E402
+    importlib.import_module("app.config")
+    return importlib.import_module("app.health_reporter")
+
+
+hr = _load_health_reporter("machine_test")
 
 
 class TestHealthPayload(unittest.TestCase):
@@ -59,11 +76,13 @@ class TestHealthPayload(unittest.TestCase):
             "vend_api": lambda: True,
             "poller": lambda: True,
         }
-        payload = hr.build_health_payload(
-            now_iso="2026-08-02T20:00:00Z",
-            collectors=collectors,
-        )
+        with patch.object(hr, "MACHINE_ID", "machine_002"):
+            payload = hr.build_health_payload(
+                now_iso="2026-08-02T20:00:00Z",
+                collectors=collectors,
+            )
         self.assertEqual(payload["schema_version"], 1)
+        self.assertEqual(payload["machine_id"], "machine_002")
         self.assertEqual(payload["hostname"], "pi-test")
         self.assertEqual(payload["app_version"], "abc1234")
         self.assertEqual(payload["reported_at"], "2026-08-02T20:00:00Z")
@@ -71,7 +90,6 @@ class TestHealthPayload(unittest.TestCase):
         self.assertTrue(payload["hardware"]["tof_connected"])
         self.assertTrue(payload["hardware"]["motor_controller_connected"])
         self.assertEqual(payload["errors"], [])
-        # Must not include secrets / env dumps
         blob = str(payload)
         self.assertNotIn("MACHINE_SHARED_TOKEN", blob)
         self.assertNotIn("CHANGE_ME", blob)
@@ -102,15 +120,9 @@ class TestHealthPayload(unittest.TestCase):
         def boom():
             raise RuntimeError("nope")
 
-        # build_health_payload wraps collectors that append to errors themselves;
-        # simulate via collector returning values while injecting an error through
-        # a custom disk reader that uses the real error path.
         errors_seen = []
 
         def disk_with_error():
-            # Mimic read_disk_percent failure path by calling real helper with local list
-            # through collectors that raise — the builder calls collectors directly,
-            # so wrap to catch:
             try:
                 boom()
             except Exception as exc:  # noqa: BLE001
@@ -148,22 +160,35 @@ class TestHealthSubmit(unittest.TestCase):
         resp.json.return_value = {"ok": True, "status": "healthy"}
         session.post.return_value = resp
 
-        payload = {"machine_id": "machine_001", "schema_version": 1}
+        payload = {"machine_id": "machine_002", "schema_version": 1}
         result = hr.submit_health_report(payload)
         self.assertTrue(result["ok"])
         kwargs = session.post.call_args.kwargs
         self.assertEqual(kwargs["headers"]["X-Machine-Token"], "secret-token")
-        self.assertIn("/machines/machine_001/health", session.post.call_args.args[0])
+        self.assertIn("/machines/machine_002/health", session.post.call_args.args[0])
+
+    @patch.object(hr, "MACHINE_SHARED_TOKEN", "secret-token")
+    @patch.object(hr, "MACHINE_ID", "machine_002")
+    @patch.object(hr, "SESSION")
+    def test_submit_uses_module_machine_id_when_payload_omits(self, session):
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.raise_for_status = MagicMock()
+        resp.json.return_value = {"ok": True}
+        session.post.return_value = resp
+
+        hr.submit_health_report({"schema_version": 1})
+        self.assertIn("/machines/machine_002/health", session.post.call_args.args[0])
 
     @patch.object(hr, "MACHINE_SHARED_TOKEN", "")
     def test_submit_requires_token(self):
         with self.assertRaises(RuntimeError):
-            hr.submit_health_report({"machine_id": "machine_001"})
+            hr.submit_health_report({"machine_id": "machine_002"})
 
     @patch.object(hr, "submit_health_report", side_effect=RuntimeError("down"))
     @patch.object(hr, "build_health_payload")
     def test_run_once_submit_failure_returns_nonzero(self, build, _submit):
-        build.return_value = {"machine_id": "machine_001", "errors": []}
+        build.return_value = {"machine_id": "machine_002", "errors": []}
         code = hr.run_once(submit=True, print_payload=False)
         self.assertEqual(code, 1)
 

@@ -28,11 +28,12 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
+from app.config import MACHINE_ID
+
 CLOUD_BASE = os.getenv(
     "CLOUD_BASE",
     "https://sellmatecloud-1002770348452.us-west4.run.app",
 ).rstrip("/")
-MACHINE_ID = os.getenv("MACHINE_ID", "machine_001")
 MACHINE_SHARED_TOKEN = os.getenv("MACHINE_SHARED_TOKEN", "")
 HEALTH_INTERVAL_SECONDS = float(os.getenv("HEALTH_INTERVAL_SECONDS", "60"))
 HEALTH_JITTER_SECONDS = float(os.getenv("HEALTH_JITTER_SECONDS", "10"))

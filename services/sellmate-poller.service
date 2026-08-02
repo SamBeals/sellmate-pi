@@ -7,6 +7,8 @@ Wants=network-online.target vend-api.service
 Type=simple
 User=sambeals
 WorkingDirectory=/home/sambeals/sellmate-pi/app
+# Shared machine identity + cloud settings (MACHINE_ID required).
+EnvironmentFile=/etc/sellmate/machine.env
 Environment=VEND_API_KEY=CHANGE_ME
 Environment=PYTHONUNBUFFERED=1
 # Short-poll: cloud returns immediately; Pi sleeps after NO_JOB.

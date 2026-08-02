@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import importlib
+import os
 import sys
 import types
 import unittest
@@ -9,7 +11,8 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 # cloud_poller.py lives under app/
-_APP_DIR = Path(__file__).resolve().parents[1] / "app"
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_APP_DIR = _REPO_ROOT / "app"
 if str(_APP_DIR) not in sys.path:
     sys.path.insert(0, str(_APP_DIR))
 
@@ -42,9 +45,17 @@ def _ensure_requests_stub():
     sys.modules["requests"] = requests
 
 
-_ensure_requests_stub()
+def _load_poller(machine_id: str = "machine_test"):
+    """Import cloud_poller with a required MACHINE_ID (no silent default)."""
+    _ensure_requests_stub()
+    os.environ["MACHINE_ID"] = machine_id
+    for name in ("config", "cloud_poller"):
+        sys.modules.pop(name, None)
+    importlib.import_module("config")
+    return importlib.import_module("cloud_poller")
 
-import cloud_poller as poller  # noqa: E402
+
+poller = _load_poller("machine_test")
 
 
 class TestClaimShortPoll(unittest.TestCase):
@@ -80,6 +91,20 @@ class TestClaimShortPoll(unittest.TestCase):
 
         result = poller.claim_vend_job()
         self.assertEqual(result["vend_job_id"], "job-1")
+
+    @patch.object(poller, "SESSION")
+    def test_claim_uses_configured_machine_id(self, session):
+        resp = MagicMock()
+        resp.json.return_value = {"status": "NO_JOB"}
+        resp.raise_for_status = MagicMock()
+        session.get.return_value = resp
+
+        with patch.object(poller, "MACHINE_ID", "machine_002"):
+            poller.claim_vend_job()
+
+        _args, kwargs = session.get.call_args
+        self.assertEqual(kwargs["params"]["machine_id"], "machine_002")
+        self.assertNotEqual(kwargs["params"]["machine_id"], "machine_001")
 
 
 class TestBackoff(unittest.TestCase):
@@ -141,6 +166,19 @@ class TestMainLoop(unittest.TestCase):
             sleep.call_args_list[2].args[0],
             poller.POLL_INTERVAL_SECONDS,
         )
+
+
+class TestNoSilentMachineDefault(unittest.TestCase):
+    def test_poller_import_requires_machine_id(self):
+        _ensure_requests_stub()
+        os.environ.pop("MACHINE_ID", None)
+        for name in ("config", "cloud_poller"):
+            sys.modules.pop(name, None)
+        with self.assertRaises(Exception) as ctx:
+            importlib.import_module("cloud_poller")
+        self.assertIn("MACHINE_ID", str(ctx.exception))
+        # Restore default test module for later classes if discovery reorders.
+        _load_poller("machine_test")
 
 
 if __name__ == "__main__":
