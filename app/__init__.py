@@ -1,0 +1,1 @@
+"""SellMate Pi application package."""

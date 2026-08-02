@@ -1,0 +1,26 @@
+[Unit]
+Description=SellMate Pi Health Reporter
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sambeals
+WorkingDirectory=/home/sambeals/sellmate-pi
+Environment=PYTHONUNBUFFERED=1
+Environment=MACHINE_ID=machine_001
+Environment=CLOUD_BASE=https://sellmatecloud-1002770348452.us-west4.run.app
+# Must match SellMateCloud MACHINE_SHARED_TOKEN (Cloud Run secret/env).
+Environment=MACHINE_SHARED_TOKEN=CHANGE_ME
+Environment=HEALTH_INTERVAL_SECONDS=60
+Environment=HEALTH_JITTER_SECONDS=10
+Environment=HEALTH_HTTP_TIMEOUT_SECONDS=8
+Environment=I2C_BUS=1
+Environment=I2C_ADDR=0x27
+Environment=TOF_I2C_ADDR=0x29
+ExecStart=/home/sambeals/sellmate-pi/.venv/bin/python -m app.health_reporter
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
