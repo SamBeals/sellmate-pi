@@ -27,10 +27,15 @@ from typing import Optional, List, Dict, Any, Tuple
 from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel, Field, model_validator
 
+from commissioning import get_commissioning_service
+from topology_discovery import LiveBackend
+from topology_mapping import LEGACY_SLOT_TO_HW, resolve_hw
+from topology_store import get_topology_store
+
 
 app = FastAPI(
     title="SellMate Vend API",
-    version="1.3.0",
+    version="1.4.0",
 )
 
 
@@ -73,14 +78,9 @@ API_KEY = os.getenv("VEND_API_KEY", "CHANGE_ME")
 
 SLOT_RE = re.compile(r"^S\d{2}$")
 
-SLOT_TO_MASK: Dict[str, Dict[str, Any]] = {
-    "S01": {"bank": "A", "mask": 1},
-    "S02": {"bank": "A", "mask": 2},
-    "S03": {"bank": "A", "mask": 4},
-    "S04": {"bank": "A", "mask": 8},
-    "S05": {"bank": "A", "mask": 16},
-    "S06": {"bank": "A", "mask": 32},
-}
+# Legacy static map retained for unmigrated machines. Commissioned machines
+# resolve through the active approved topology (see resolve_slot_to_hw).
+SLOT_TO_MASK: Dict[str, Dict[str, Any]] = dict(LEGACY_SLOT_TO_HW)
 
 
 # Only one vending operation may run at a time.
@@ -290,15 +290,100 @@ class VendSequenceRequest(BaseModel):
         return self
 
 
+class CommissioningStartRequest(BaseModel):
+    technician_actor: Optional[str] = None
+    pin: Optional[str] = None
+
+
+class CommissioningProposePosition(BaseModel):
+    column_index: int = Field(..., ge=0, le=63)
+    discovery_id: Optional[str] = None
+    bank: Optional[str] = None
+    mask: Optional[int] = None
+    position_id: Optional[str] = None
+    label: Optional[str] = None
+    legacy_slot_id: Optional[str] = None
+
+
+class CommissioningProposeShelf(BaseModel):
+    shelf_id: str
+    row_index: int = Field(default=0, ge=0, le=31)
+    label: Optional[str] = None
+    positions: List[CommissioningProposePosition] = Field(..., min_length=1)
+
+
+class CommissioningProposeRequest(BaseModel):
+    shelves: List[CommissioningProposeShelf] = Field(..., min_length=1)
+    existing_planogram_slot_ids: Optional[List[str]] = None
+
+
+class CommissioningConfirmRequest(BaseModel):
+    force: bool = False
+    actor: Optional[str] = None
+
+
+class ValidatePositionRequest(BaseModel):
+    bank: str = Field(default="A")
+    mask: int = Field(..., ge=1, le=65535)
+    pulse_seconds: float = Field(default=1.0, ge=0.05, le=5.0)
+    tof_wait_seconds: float = Field(default=TOF_WAIT_SECONDS, ge=0.1, le=10.0)
+    tof_baseline_seconds: float = Field(
+        default=TOF_BASELINE_SECONDS,
+        ge=0.5,
+        le=1.0,
+    )
+    tof_drop_threshold_cm: float = Field(
+        default=TOF_DROP_THRESHOLD_CM,
+        ge=0.5,
+        le=50.0,
+    )
+    tof_consecutive_hits: int = Field(
+        default=TOF_CONSECUTIVE_HITS,
+        ge=1,
+        le=10,
+    )
+    tof_sample_interval_seconds: float = Field(
+        default=TOF_SAMPLE_INTERVAL_SECONDS,
+        ge=0.02,
+        le=1.0,
+    )
+
+    @model_validator(mode="after")
+    def validate_mask_single_bit(self):
+        _reg_for_bank(self.bank)
+        if not _is_single_bit(self.mask):
+            raise ValueError("mask must be single-bit, meaning a power of two")
+        return self
+
+
 # =========================================================
 # General helpers
 # =========================================================
+
+TECHNICIAN_PIN = os.getenv("TECHNICIAN_PIN", "4130")
+
 
 def _require_api_key(x_api_key: Optional[str]) -> None:
     if API_KEY and x_api_key != API_KEY:
         raise HTTPException(
             status_code=401,
             detail="Unauthorized",
+        )
+
+
+def _require_customer_service_available() -> None:
+    service = get_commissioning_service()
+    if service.out_of_service:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "message": (
+                    "This machine is temporarily out of service "
+                    "for maintenance / commissioning."
+                ),
+                "out_of_service": True,
+                "code": "commissioning_active",
+            },
         )
 
 
@@ -345,54 +430,44 @@ def _reg_for_bank(bank: str) -> str:
 
 
 def resolve_slot_to_hw(slot_id: str) -> Tuple[str, int]:
-    normalized_slot = normalize_slot_id(slot_id)
-    config = SLOT_TO_MASK.get(normalized_slot)
+    """
+    Resolve a legacy slot ID or topology position_id to bank/mask.
 
-    if config is None:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"Unknown slot_id '{normalized_slot}'. "
-                "No hardware mapping exists on this Pi."
-            ),
+    Commissioned machines use the active approved topology. Unmigrated
+    machines fall back to the static SLOT_TO_MASK table.
+    """
+    raw = (slot_id or "").strip()
+    if not raw:
+        raise HTTPException(status_code=400, detail="slot_id is required")
+
+    # Legacy Sxx IDs still validate format; position_ids may be free-form.
+    if SLOT_RE.match(raw.upper()):
+        normalize_slot_id(raw)
+
+    try:
+        active = get_topology_store().load_active()
+        resolved = resolve_hw(
+            raw,
+            active_revision=active,
+            legacy_map=SLOT_TO_MASK,
         )
+    except KeyError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    if not isinstance(config, dict):
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                f"Invalid mapping for {normalized_slot}: "
-                f"expected dict, received {type(config)}"
-            ),
-        )
-
-    bank = (config.get("bank") or "A").strip().upper()
+    bank = str(resolved["bank"]).upper()
+    mask = int(resolved["mask"])
 
     if bank not in ("A", "B"):
         raise HTTPException(
             status_code=500,
-            detail=(
-                f"Invalid mapping for {normalized_slot}: "
-                "bank must be A or B."
-            ),
-        )
-
-    mask = config.get("mask", config.get("bit_value"))
-
-    if not isinstance(mask, int):
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                f"Invalid mapping for {normalized_slot}: "
-                "mask must be an integer."
-            ),
+            detail=f"Invalid mapping for {raw}: bank must be A or B.",
         )
 
     if not _is_single_bit(mask):
         raise HTTPException(
             status_code=500,
             detail=(
-                f"Invalid mapping for {normalized_slot}: "
+                f"Invalid mapping for {raw}: "
                 f"mask {mask} is not single-bit."
             ),
         )
@@ -956,6 +1031,21 @@ def startup() -> None:
     init_tof_sensor()
     set_light_state_safe(STATE_IDLE)
 
+    # Wire live discovery backend for technician commissioning.
+    service = get_commissioning_service()
+    service.live_backend = LiveBackend(
+        ensure_controller=ensure_i2c_ready,
+        tof_available=lambda: bool(TOF_AVAILABLE),
+        tof_error=lambda: TOF_ERROR,
+        beam_available=lambda: bool(GPIO_AVAILABLE and GPIO_INITIALIZED),
+        beam_error=lambda: GPIO_ERROR,
+        i2c_bus=str(I2C_BUS),
+        i2c_address=str(I2C_ADDR),
+    )
+    # Avoid blocking API startup on cloud publish failures during local ops.
+    if os.getenv("COMMISSIONING_CLOUD_PUBLISH", "true").lower() == "false":
+        service.publish = False
+
     print(
         "[STARTUP] SellMate Vend API startup completed",
         flush=True,
@@ -994,6 +1084,8 @@ def root():
 
 @app.get("/health")
 def health():
+    commissioning = get_commissioning_service().status()
+    active = get_topology_store().load_active()
     return {
         "ok": True,
         "service": "SellMate Vend API",
@@ -1026,6 +1118,15 @@ def health():
         "lights": {
             "available": LIGHTS_AVAILABLE,
             "error": LIGHTS_ERROR,
+        },
+        "commissioning": {
+            "out_of_service": commissioning.get("out_of_service"),
+            "session_status": (
+                (commissioning.get("session") or {}).get("status")
+            ),
+            "active_revision_id": (
+                active.revision_id if active else None
+            ),
         },
     }
 
@@ -1114,6 +1215,7 @@ async def vend_mask(
     x_api_key: Optional[str] = Header(default=None),
 ):
     _require_api_key(x_api_key)
+    _require_customer_service_available()
 
     async with _vend_lock:
         try:
@@ -1156,8 +1258,13 @@ async def vend(
     x_api_key: Optional[str] = Header(default=None),
 ):
     _require_api_key(x_api_key)
+    _require_customer_service_available()
 
     bank, mask = resolve_slot_to_hw(req.slot_id)
+    if SLOT_RE.match((req.slot_id or "").strip().upper()):
+        response_slot_id = normalize_slot_id(req.slot_id)
+    else:
+        response_slot_id = (req.slot_id or "").strip()
 
     async with _vend_lock:
         try:
@@ -1186,7 +1293,7 @@ async def vend(
     return {
         "ok": True,
         "mode": "vend",
-        "slot_id": normalize_slot_id(req.slot_id),
+        "slot_id": response_slot_id,
         "bank": bank,
         "mask": hex(mask),
         "pulses": req.pulses,
@@ -1215,6 +1322,7 @@ async def vend_mask_verified(
     if TOF_VERIFICATION_ENABLED:
         async with _vend_lock:
             try:
+                _require_customer_service_available()
                 return await _vend_with_tof_verification(req)
 
             except HTTPException:
@@ -1235,6 +1343,7 @@ async def vend_mask_verified(
 
     async with _vend_lock:
         try:
+            _require_customer_service_available()
             ensure_i2c_ready()
             set_light_state_safe(STATE_PAYMENT_AUTHORIZED)
 
@@ -1484,6 +1593,7 @@ async def vend_sequence(
     x_api_key: Optional[str] = Header(default=None),
 ):
     _require_api_key(x_api_key)
+    _require_customer_service_available()
 
     async with _vend_lock:
         try:
@@ -1529,3 +1639,221 @@ async def vend_sequence(
             for step in req.steps
         ],
     }
+
+
+# =========================================================
+# FEATURE-013 commissioning (local boundary for kiosk)
+# =========================================================
+
+@app.get("/commissioning/status")
+def commissioning_status(
+    x_api_key: Optional[str] = Header(default=None),
+):
+    _require_api_key(x_api_key)
+    return get_commissioning_service().status()
+
+
+@app.get("/topology/active")
+def topology_active(
+    x_api_key: Optional[str] = Header(default=None),
+    vendor_safe: bool = False,
+):
+    """Return active approved topology. vendor_safe strips raw HW ids."""
+    _require_api_key(x_api_key)
+    active = get_topology_store().load_active()
+    if active is None:
+        return {"ok": True, "active": None, "commissioned": False}
+    payload = active.vendor_safe_dict() if vendor_safe else active.to_dict()
+    return {"ok": True, "active": payload, "commissioned": True}
+
+
+@app.get("/topology/audit")
+def topology_audit(
+    x_api_key: Optional[str] = Header(default=None),
+    limit: int = 50,
+):
+    _require_api_key(x_api_key)
+    events = get_topology_store().list_audit(limit=max(1, min(limit, 200)))
+    return {
+        "ok": True,
+        "events": [e.to_dict() for e in events],
+    }
+
+
+@app.post("/commissioning/start")
+def commissioning_start(
+    req: CommissioningStartRequest,
+    x_api_key: Optional[str] = Header(default=None),
+):
+    """Enter technician commissioning mode (kiosk out of service)."""
+    _require_api_key(x_api_key)
+    if TECHNICIAN_PIN and (req.pin or "") != TECHNICIAN_PIN:
+        raise HTTPException(status_code=401, detail="Invalid technician PIN")
+
+    try:
+        session = get_commissioning_service().start(
+            technician_actor=req.technician_actor,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    return {
+        "ok": True,
+        "session": session.to_dict(),
+        "out_of_service": True,
+        "customer_message": (
+            "This machine is temporarily out of service for maintenance."
+        ),
+    }
+
+
+@app.post("/commissioning/discover")
+def commissioning_discover(
+    x_api_key: Optional[str] = Header(default=None),
+):
+    _require_api_key(x_api_key)
+    try:
+        snapshot = get_commissioning_service().discover()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"ok": True, "discovery": snapshot.to_dict()}
+
+
+@app.post("/commissioning/propose")
+def commissioning_propose(
+    req: CommissioningProposeRequest,
+    x_api_key: Optional[str] = Header(default=None),
+):
+    _require_api_key(x_api_key)
+    shelves = []
+    for shelf in req.shelves:
+        shelves.append(
+            {
+                "shelf_id": shelf.shelf_id,
+                "row_index": shelf.row_index,
+                "label": shelf.label,
+                "positions": [p.model_dump() for p in shelf.positions],
+            }
+        )
+    try:
+        revision = get_commissioning_service().propose_layout(
+            shelves,
+            existing_planogram_slot_ids=req.existing_planogram_slot_ids,
+        )
+    except (RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return {
+        "ok": True,
+        "proposed": revision.to_dict(),
+        "blocked": bool(
+            revision.planogram_impact and revision.planogram_impact.destructive
+        ),
+    }
+
+
+@app.post("/commissioning/confirm")
+def commissioning_confirm(
+    req: CommissioningConfirmRequest,
+    x_api_key: Optional[str] = Header(default=None),
+):
+    _require_api_key(x_api_key)
+    try:
+        revision = get_commissioning_service().confirm(
+            force=req.force,
+            actor=req.actor,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    return {
+        "ok": True,
+        "active": revision.to_dict(),
+        "out_of_service": False,
+    }
+
+
+@app.post("/commissioning/cancel")
+def commissioning_cancel(
+    x_api_key: Optional[str] = Header(default=None),
+):
+    _require_api_key(x_api_key)
+    get_commissioning_service().cancel()
+    return {"ok": True, "out_of_service": False}
+
+
+@app.post("/commissioning/validate_position")
+async def commissioning_validate_position(
+    req: ValidatePositionRequest,
+    x_api_key: Optional[str] = Header(default=None),
+):
+    """
+    Technician lane validation without a sale: pulse + ToF (preferred).
+    Requires an active commissioning session.
+    """
+    _require_api_key(x_api_key)
+    service = get_commissioning_service()
+    if not service.out_of_service:
+        raise HTTPException(
+            status_code=409,
+            detail="Validation requires an active commissioning session",
+        )
+
+    verified_req = VendMaskVerifiedRequest(
+        bank=req.bank,
+        mask=req.mask,
+        pulse_seconds=req.pulse_seconds,
+        tof_wait_seconds=req.tof_wait_seconds,
+        tof_baseline_seconds=req.tof_baseline_seconds,
+        tof_drop_threshold_cm=req.tof_drop_threshold_cm,
+        tof_consecutive_hits=req.tof_consecutive_hits,
+        tof_sample_interval_seconds=req.tof_sample_interval_seconds,
+        retry_attempts=0,
+    )
+
+    async with _vend_lock:
+        try:
+            if TOF_AVAILABLE or TOF_VERIFICATION_ENABLED:
+                result = await _vend_with_tof_verification(verified_req)
+            else:
+                # Fall back to a short pulse when ToF is unavailable; beam
+                # verification remains available via the test endpoint.
+                ensure_i2c_ready()
+                await _pulse_mask_once(req.bank, req.mask, req.pulse_seconds)
+                result = {
+                    "ok": True,
+                    "verified": False,
+                    "motor_activated": True,
+                    "verification_type": "none",
+                    "message": (
+                        "Motor pulsed; ToF unavailable for drop validation."
+                    ),
+                }
+        except HTTPException:
+            raise
+        except Exception as e:
+            traceback.print_exc()
+            raise HTTPException(status_code=500, detail=str(e)) from e
+        finally:
+            clear_vend_outputs_safe()
+
+    from topology_audit import record_audit_event
+
+    session = service.status().get("session") or {}
+    record_audit_event(
+        machine_id=session.get("machine_id") or os.getenv("MACHINE_ID") or "",
+        event_type="validation_result",
+        summary=(
+            "Position validation "
+            f"{'passed' if result.get('verified') else 'completed'}"
+        ),
+        session_id=session.get("session_id"),
+        details={
+            "bank": req.bank.upper(),
+            "mask": req.mask,
+            "verified": bool(result.get("verified")),
+            "verification_type": result.get("verification_type"),
+        },
+        store=get_topology_store(),
+    )
+    return {"ok": True, "validation": result}

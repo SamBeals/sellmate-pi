@@ -4,6 +4,8 @@ import requests
 from typing import Any, Dict, List, Optional, Tuple
 
 from config import MACHINE_ID
+from topology_mapping import LEGACY_SLOT_TO_HW, resolve_hw
+from topology_store import get_topology_store
 
 CLOUD_BASE = os.getenv(
     "CLOUD_BASE",
@@ -60,14 +62,8 @@ DEFAULT_TOF_SAMPLE_INTERVAL_SECONDS = float(
 SESSION = requests.Session()
 
 
-SLOT_TO_HW: Dict[str, Dict[str, Any]] = {
-    "S01": {"bank": "A", "mask": 1},
-    "S02": {"bank": "A", "mask": 2},
-    "S03": {"bank": "A", "mask": 4},
-    "S04": {"bank": "A", "mask": 8},
-    "S05": {"bank": "A", "mask": 16},
-    "S06": {"bank": "A", "mask": 32},
-}
+# Legacy fallback for unmigrated machines. Prefer active approved topology.
+SLOT_TO_HW: Dict[str, Dict[str, Any]] = dict(LEGACY_SLOT_TO_HW)
 
 
 def log(msg: str) -> None:
@@ -123,18 +119,28 @@ def claim_vend_job() -> Optional[Dict[str, Any]]:
 
 
 def slot_to_hw(slot_id: str) -> Dict[str, Any]:
-    sid = (slot_id or "").strip().upper()
-    cfg = SLOT_TO_HW.get(sid)
+    """
+    Resolve vend job slot_id (legacy or position_id) to bank/mask.
 
-    if cfg is None:
-        raise ValueError(
-            f"Unknown slot_id '{slot_id}' in poller mapping"
+    Uses active approved topology when the machine is commissioned; otherwise
+    the static legacy SLOT_TO_HW map.
+    """
+    try:
+        active = get_topology_store().load_active()
+        resolved = resolve_hw(
+            slot_id,
+            active_revision=active,
+            legacy_map=SLOT_TO_HW,
         )
+    except KeyError as exc:
+        raise ValueError(str(exc)) from exc
 
     return {
-        "slot_id": sid,
-        "bank": cfg["bank"],
-        "mask": int(cfg["mask"]),
+        "slot_id": resolved["slot_id"],
+        "bank": resolved["bank"],
+        "mask": int(resolved["mask"]),
+        "position_id": resolved.get("position_id"),
+        "source": resolved.get("source"),
     }
 
 

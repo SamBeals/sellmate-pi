@@ -1,0 +1,65 @@
+{
+  "motor_controller_present": true,
+  "sensing": {
+    "tof_available": true,
+    "tof_sensor": "VL53L1X",
+    "beam_available": false,
+    "preferred_verification": "tof"
+  },
+  "motors": [
+    {
+      "bank": "A",
+      "mask": 1,
+      "addressable": true,
+      "probe_ok": true,
+      "legacy_slot_hint": "S01",
+      "label_hint": "S01",
+      "diagnostics": { "source": "simulation" }
+    },
+    {
+      "bank": "A",
+      "mask": 2,
+      "addressable": true,
+      "probe_ok": true,
+      "legacy_slot_hint": "S02",
+      "label_hint": "S02",
+      "diagnostics": { "source": "simulation" }
+    },
+    {
+      "bank": "A",
+      "mask": 4,
+      "addressable": true,
+      "probe_ok": true,
+      "legacy_slot_hint": "S03",
+      "label_hint": "S03",
+      "diagnostics": { "source": "simulation" }
+    },
+    {
+      "bank": "A",
+      "mask": 8,
+      "addressable": true,
+      "probe_ok": true,
+      "legacy_slot_hint": "S04",
+      "label_hint": "S04",
+      "diagnostics": { "source": "simulation" }
+    },
+    {
+      "bank": "A",
+      "mask": 16,
+      "addressable": true,
+      "probe_ok": true,
+      "legacy_slot_hint": "S05",
+      "label_hint": "S05",
+      "diagnostics": { "source": "simulation" }
+    },
+    {
+      "bank": "A",
+      "mask": 32,
+      "addressable": true,
+      "probe_ok": true,
+      "legacy_slot_hint": "S06",
+      "label_hint": "S06",
+      "diagnostics": { "source": "simulation" }
+    }
+  ]
+}
