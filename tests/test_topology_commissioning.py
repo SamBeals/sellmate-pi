@@ -6,8 +6,10 @@ import json
 import os
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _APP_DIR = _REPO_ROOT / "app"
@@ -18,12 +20,19 @@ from commissioning import (  # noqa: E402
     evaluate_planogram_impact,
     reset_commissioning_service_for_tests,
 )
+from commissioning_auth import (  # noqa: E402
+    can_commission,
+    can_view_diagnostics,
+    filter_status_payload,
+    normalize_role,
+    require_commissioning_role,
+)
 from topology_discovery import (  # noqa: E402
     SimulationBackend,
     load_simulation_fixture,
     run_discovery,
 )
-from topology_mapping import resolve_hw  # noqa: E402
+from topology_mapping import build_legacy_slot_map, resolve_hw  # noqa: E402
 from topology_migration import (  # noqa: E402
     migrate_legacy_slots_to_topology,
     planogram_slot_compat_rows,
@@ -73,6 +82,15 @@ class TestMapping(unittest.TestCase):
         with self.assertRaises(KeyError):
             resolve_hw("S99", active_revision=revision)
 
+    def test_build_legacy_slot_map(self):
+        raw = json.loads(
+            (FIXTURE_DIR / "topology_active_v1.json").read_text(encoding="utf-8")
+        )
+        revision = TopologyRevision.from_dict(raw)
+        mapping = build_legacy_slot_map(revision)
+        self.assertEqual(mapping["S01"]["mask"], 1)
+        self.assertEqual(mapping["S02"]["position_id"], "pos_s02")
+
 
 class TestDiscoverySimulation(unittest.TestCase):
     def test_simulation_discovers_fixture_motors(self):
@@ -100,6 +118,56 @@ class TestMigration(unittest.TestCase):
         self.assertEqual(rows[0]["position_id"], "pos_s01")
 
 
+class TestCommissioningAuth(unittest.TestCase):
+    def test_role_aliases_and_gates(self):
+        self.assertEqual(normalize_role("tech"), "technician")
+        self.assertTrue(can_commission("trusted_vendor"))
+        self.assertFalse(can_commission("vendor"))
+        self.assertTrue(can_view_diagnostics("admin"))
+        self.assertFalse(can_view_diagnostics("trusted_vendor"))
+        with self.assertRaises(PermissionError):
+            require_commissioning_role("vendor")
+
+    def test_vendor_status_hides_proposed(self):
+        filtered = filter_status_payload(
+            {
+                "ok": True,
+                "out_of_service": True,
+                "customer_message": "maintenance",
+                "session": {"session_id": "cms_1", "discovery": {"motors": []}},
+                "proposed": {"revision_id": "rev_1", "shelves": []},
+                "active": {
+                    "revision_id": "rev_a",
+                    "shelves": [
+                        {
+                            "shelf_id": "s1",
+                            "positions": [
+                                {
+                                    "position_id": "p1",
+                                    "hardware": {"bank": "A", "mask": 1},
+                                    "capabilities": ["motor_lane"],
+                                }
+                            ],
+                        }
+                    ],
+                    "sensing": {
+                        "preferred_verification": "tof",
+                        "tof_available": True,
+                        "beam_available": False,
+                        "tof_error": None,
+                    },
+                },
+            },
+            role="vendor",
+        )
+        self.assertIsNone(filtered["session"])
+        self.assertIsNone(filtered["proposed"])
+        self.assertNotIn(
+            "hardware",
+            filtered["active"]["shelves"][0]["positions"][0],
+        )
+
+
 class TestCommissioningFlow(unittest.TestCase):
     def setUp(self):
         self._tmpdir = tempfile.TemporaryDirectory()
@@ -124,30 +192,30 @@ class TestCommissioningFlow(unittest.TestCase):
 
         snapshot = self.service.discover()
         self.assertEqual(len(snapshot.motors), 6)
+        suggested = self.service.suggested_layout_from_discovery()
+        self.assertEqual(len(suggested[0]["positions"]), 6)
 
-        shelves = [
-            {
-                "shelf_id": "shelf_1",
-                "row_index": 0,
-                "label": "Shelf 1",
-                "positions": [
-                    {
-                        "discovery_id": m.discovery_id,
-                        "column_index": idx,
-                        "legacy_slot_id": m.legacy_slot_hint,
-                        "label": m.label_hint,
-                    }
-                    for idx, m in enumerate(snapshot.motors)
-                ],
-            }
-        ]
-        proposed = self.service.propose_layout(shelves)
+        proposed = self.service.propose_layout(suggested)
         self.assertEqual(proposed.status, "proposed")
         self.assertFalse(
             proposed.planogram_impact.destructive
             if proposed.planogram_impact
             else False
         )
+
+        updated = self.service.record_validation_result(
+            bank="A",
+            mask=1,
+            verified=True,
+            verification_type="tof",
+        )
+        self.assertIsNotNone(updated)
+        pos = next(
+            p
+            for p in updated.all_positions()
+            if p.hardware and p.hardware.mask == 1
+        )
+        self.assertEqual(pos.validation_status, "valid")
 
         active = self.service.confirm(actor="tech-1")
         self.assertEqual(active.status, "active")
@@ -161,7 +229,12 @@ class TestCommissioningFlow(unittest.TestCase):
         types = [e.event_type for e in audit]
         self.assertIn("session_started", types)
         self.assertIn("discovery_completed", types)
+        self.assertIn("validation_result", types)
         self.assertIn("revision_approved", types)
+
+        maint = self.service.customer_maintenance_status()
+        self.assertFalse(maint["out_of_service"])
+        self.assertEqual(maint["mode"], "customer")
 
     def test_destructive_rediscovery_blocks_activation(self):
         # Seed an active topology with S01-S06.
@@ -201,6 +274,16 @@ class TestCommissioningFlow(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self.service.confirm(force=False)
 
+    def test_apply_cloud_command_start_discover(self):
+        result = self.service.apply_cloud_command(
+            {"type": "start", "actor": "remote-tech"}
+        )
+        self.assertIn("session", result)
+        self.assertTrue(self.service.out_of_service)
+        discovered = self.service.apply_cloud_command({"type": "discover"})
+        self.assertEqual(len(discovered["discovery"]["motors"]), 6)
+        self.assertTrue(discovered["suggested_shelves"])
+
 
 class TestPlanogramImpact(unittest.TestCase):
     def test_preserves_unambiguous_identity(self):
@@ -215,6 +298,44 @@ class TestPlanogramImpact(unittest.TestCase):
         )
         self.assertFalse(impact.destructive)
         self.assertIn("S01", impact.preserved_legacy_slot_ids)
+
+
+class TestTopologyCloudAuth(unittest.TestCase):
+    def test_headers_use_x_machine_token(self):
+        if "requests" not in sys.modules:
+            requests = types.ModuleType("requests")
+
+            class RequestException(Exception):
+                pass
+
+            class Session:
+                pass
+
+            requests.RequestException = RequestException
+            requests.Session = Session
+            sys.modules["requests"] = requests
+
+        import importlib
+
+        import topology_cloud as tc
+
+        importlib.reload(tc)
+        with patch.object(tc, "MACHINE_SHARED_TOKEN", "secret-token"):
+            headers = tc._headers()
+        self.assertEqual(headers["X-Machine-Token"], "secret-token")
+        self.assertEqual(headers["Authorization"], "Bearer secret-token")
+
+    def test_claim_command_none_on_404(self):
+        import topology_cloud as tc
+
+        session = MagicMock()
+        resp = MagicMock()
+        resp.status_code = 404
+        resp.ok = False
+        session.get.return_value = resp
+        self.assertIsNone(
+            tc.claim_commissioning_command("machine_test", session=session)
+        )
 
 
 class TestCloudPollerResolution(unittest.TestCase):
@@ -232,8 +353,6 @@ class TestCloudPollerResolution(unittest.TestCase):
         os.environ["MACHINE_ID"] = "machine_test"
         # Ensure requests stub exists like other poller tests.
         if "requests" not in sys.modules:
-            import types
-
             requests = types.ModuleType("requests")
 
             class RequestException(Exception):

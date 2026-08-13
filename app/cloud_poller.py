@@ -26,6 +26,13 @@ ERROR_BACKOFF_BASE_SECONDS = float(
 ERROR_BACKOFF_MAX_SECONDS = float(
     os.getenv("ERROR_BACKOFF_MAX_SECONDS", "60")
 )
+# How often to pull cloud-approved active topology (remote approval sync).
+TOPOLOGY_SYNC_INTERVAL_SECONDS = float(
+    os.getenv("TOPOLOGY_SYNC_INTERVAL_SECONDS", "30")
+)
+COMMISSIONING_COMMANDS_ENABLED = (
+    os.getenv("COMMISSIONING_COMMANDS_ENABLED", "true").lower() == "true"
+)
 
 TOF_VERIFICATION_ENABLED = (
     os.getenv("TOF_VERIFICATION_ENABLED", "false").lower() == "true"
@@ -64,6 +71,8 @@ SESSION = requests.Session()
 
 # Legacy fallback for unmigrated machines. Prefer active approved topology.
 SLOT_TO_HW: Dict[str, Dict[str, Any]] = dict(LEGACY_SLOT_TO_HW)
+
+_LAST_TOPOLOGY_SYNC_AT = 0.0
 
 
 def log(msg: str) -> None:
@@ -142,6 +151,127 @@ def slot_to_hw(slot_id: str) -> Dict[str, Any]:
         "position_id": resolved.get("position_id"),
         "source": resolved.get("source"),
     }
+
+
+def sync_active_topology_from_cloud(*, force: bool = False) -> bool:
+    """
+    Pull cloud-approved active topology into the local store.
+
+    Keeps remote dashboard approvals and local vend resolution on one domain.
+    Returns True when local active was written/updated.
+    """
+    global _LAST_TOPOLOGY_SYNC_AT
+    now = time.time()
+    if (
+        not force
+        and (now - _LAST_TOPOLOGY_SYNC_AT) < TOPOLOGY_SYNC_INTERVAL_SECONDS
+    ):
+        return False
+    _LAST_TOPOLOGY_SYNC_AT = now
+
+    try:
+        from topology_cloud import pull_active_topology
+
+        remote = pull_active_topology(MACHINE_ID, session=SESSION)
+        if remote is None:
+            return False
+        if remote.status != "active":
+            return False
+
+        store = get_topology_store()
+        local = store.load_active()
+        if (
+            local is not None
+            and local.revision_id == remote.revision_id
+            and local.updated_at == remote.updated_at
+        ):
+            return False
+
+        store.save_active(remote)
+        log(
+            f"synced active topology revision={remote.revision_id} "
+            f"positions={len(remote.all_positions())}"
+        )
+        return True
+    except Exception as exc:  # noqa: BLE001 — never block vend claim loop
+        log(f"topology sync failed: {exc}")
+        return False
+
+
+def handle_commissioning_command(command: Dict[str, Any]) -> None:
+    """
+    Execute a remote commissioning command against the local service / vend API.
+
+    validate_position is routed through local HTTP so ToF/motor locks stay in
+    vend_api. Other command types use CommissioningService directly.
+    """
+    from commissioning import get_commissioning_service
+    from topology_cloud import complete_commissioning_command
+
+    command_id = str(command.get("command_id") or "")
+    cmd_type = str(command.get("type") or "").strip().lower()
+    payload = command.get("payload") or {}
+
+    log(f"commissioning_command id={command_id} type={cmd_type}")
+
+    try:
+        if cmd_type == "validate_position":
+            url = f"{PI_BASE}/commissioning/validate_position"
+            resp = SESSION.post(
+                url,
+                json=payload,
+                headers=pi_headers(),
+                timeout=REQUEST_TIMEOUT_SECONDS,
+            )
+            resp.raise_for_status()
+            result = resp.json()
+        else:
+            service = get_commissioning_service()
+            # Ensure remote start/discover publish to cloud (hybrid domain).
+            service.publish = True
+            result = service.apply_cloud_command(command)
+
+        if command_id:
+            complete_commissioning_command(
+                MACHINE_ID,
+                command_id,
+                ok=True,
+                result=result if isinstance(result, dict) else {"result": result},
+                session=SESSION,
+            )
+        log(f"commissioning_command id={command_id} OK")
+    except Exception as exc:  # noqa: BLE001 — report failure, keep poll loop
+        log(f"commissioning_command id={command_id} FAILED: {exc}")
+        if command_id:
+            try:
+                complete_commissioning_command(
+                    MACHINE_ID,
+                    command_id,
+                    ok=False,
+                    error=str(exc),
+                    session=SESSION,
+                )
+            except Exception as ack_exc:  # noqa: BLE001
+                log(f"commissioning_command ack failed: {ack_exc}")
+
+
+def poll_commissioning_once() -> bool:
+    """Claim at most one remote commissioning command. Returns True if handled."""
+    if not COMMISSIONING_COMMANDS_ENABLED:
+        return False
+    try:
+        from topology_cloud import claim_commissioning_command
+
+        command = claim_commissioning_command(MACHINE_ID, session=SESSION)
+        if not command:
+            return False
+        handle_commissioning_command(command)
+        # Remote confirm may have activated topology on cloud; refresh local.
+        sync_active_topology_from_cloud(force=True)
+        return True
+    except Exception as exc:  # noqa: BLE001 — never block vend claim loop
+        log(f"commissioning claim failed: {exc}")
+        return False
 
 
 def normalize_items(job: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -469,13 +599,23 @@ def main() -> None:
         f"error_backoff_max={ERROR_BACKOFF_MAX_SECONDS}s "
         f"using X-API-Key="
         f"{'(set)' if PI_API_KEY else '(empty)'} "
-        f"tof_verification_enabled={TOF_VERIFICATION_ENABLED}"
+        f"tof_verification_enabled={TOF_VERIFICATION_ENABLED} "
+        f"commissioning_commands={COMMISSIONING_COMMANDS_ENABLED} "
+        f"topology_sync_interval={TOPOLOGY_SYNC_INTERVAL_SECONDS}s"
     )
 
     error_sleep = ERROR_BACKOFF_BASE_SECONDS
 
     while True:
         try:
+            # Hybrid FEATURE-013: keep local active topology aligned with cloud
+            # approvals, and execute remote commissioning commands when present.
+            sync_active_topology_from_cloud()
+            handled_commissioning = poll_commissioning_once()
+            if handled_commissioning:
+                error_sleep = ERROR_BACKOFF_BASE_SECONDS
+                continue
+
             job = claim_vend_job()
 
             # Successful HTTP response (including NO_JOB) resets backoff.

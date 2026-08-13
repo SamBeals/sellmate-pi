@@ -1,9 +1,14 @@
 """
 Local commissioning orchestrator for FEATURE-013.
 
-Kiosk/technician UI drives this through vend_api local endpoints. Discovery
-never silently activates a topology; explicit confirm is required. Customer
-vend paths must treat out_of_service as blocking while a session is active.
+Primary technician UX lives in sellmate-dashboard (laptop/tablet). This service
+is the hardware authority behind:
+  - bounded local Wi-Fi vend_api commissioning routes, and
+  - remote/cloud command execution (same session/topology domain).
+
+Discovery never silently activates a topology; explicit confirm is required.
+Customer vend paths must treat out_of_service as blocking while a session is
+active. Touchscreen only reflects maintenance/out-of-service state.
 """
 
 from __future__ import annotations
@@ -66,16 +71,194 @@ class CommissioningService:
             proposed = self._proposed or self.store.load_proposed()
             return {
                 "ok": True,
-                "out_of_service": self.out_of_service,
+                "out_of_service": bool(
+                    self._session and self._session.out_of_service
+                ),
                 "session": self._session.to_dict() if self._session else None,
                 "active": active.to_dict() if active else None,
                 "proposed": proposed.to_dict() if proposed else None,
                 "customer_message": (
                     "This machine is temporarily out of service for maintenance."
-                    if self.out_of_service
+                    if (self._session and self._session.out_of_service)
                     else None
                 ),
             }
+
+    def customer_maintenance_status(self) -> Dict[str, Any]:
+        """Minimal out-of-service contract for touchscreen / customer UI."""
+        with self._lock:
+            oos = bool(self._session and self._session.out_of_service)
+            session_status = self._session.status if self._session else None
+            return {
+                "ok": True,
+                "out_of_service": oos,
+                "mode": "commissioning" if oos else "customer",
+                "session_status": session_status if oos else None,
+                "customer_message": (
+                    "This machine is temporarily out of service for maintenance."
+                    if oos
+                    else None
+                ),
+            }
+
+    def suggested_layout_from_discovery(self) -> List[Dict[str, Any]]:
+        """
+        Build a single-shelf suggested layout from discovery order.
+
+        Physical left-to-right order is NOT claimed to be correct; technicians
+        must confirm/reorder. This is only a starting point for dashboard UX.
+        """
+        with self._lock:
+            session = self._require_session()
+            if session.discovery is None:
+                raise RuntimeError("Run discovery before suggesting a layout")
+            motors = list(session.discovery.motors)
+            return [
+                {
+                    "shelf_id": "shelf_1",
+                    "row_index": 0,
+                    "label": "Shelf 1",
+                    "positions": [
+                        {
+                            "discovery_id": m.discovery_id,
+                            "column_index": idx,
+                            "legacy_slot_id": m.legacy_slot_hint,
+                            "label": m.label_hint,
+                        }
+                        for idx, m in enumerate(motors)
+                    ],
+                }
+            ]
+
+    def record_validation_result(
+        self,
+        *,
+        bank: str,
+        mask: int,
+        verified: bool,
+        verification_type: Optional[str] = None,
+        details: Optional[Dict[str, Any]] = None,
+    ) -> Optional[TopologyRevision]:
+        """
+        Update proposed position validation_status after a lane validation pulse.
+        Does not activate topology.
+        """
+        with self._lock:
+            session = self._require_session()
+            session.status = "validating"
+            session.updated_at = utc_now_iso()
+
+            revision = self._proposed or self.store.load_proposed()
+            target_key = hw_key(bank, mask)
+            updated = False
+            if revision is not None:
+                for shelf in revision.shelves:
+                    for position in shelf.positions:
+                        if (
+                            position.hardware
+                            and hw_key(
+                                position.hardware.bank, position.hardware.mask
+                            )
+                            == target_key
+                        ):
+                            position.validation_status = (
+                                "valid" if verified else "failed"
+                            )
+                            updated = True
+                if updated:
+                    revision.updated_at = utc_now_iso()
+                    self._proposed = revision
+                    self.store.save_proposed(revision)
+                    self._maybe_publish_revision(revision)
+
+            event = record_audit_event(
+                machine_id=session.machine_id,
+                event_type="validation_result",
+                summary=(
+                    "Position validation "
+                    + ("passed" if verified else "failed/incomplete")
+                ),
+                session_id=session.session_id,
+                revision_id=revision.revision_id if revision else None,
+                actor=session.technician_actor,
+                details={
+                    "bank": str(bank).upper(),
+                    "mask": int(mask),
+                    "verified": bool(verified),
+                    "verification_type": verification_type,
+                    "updated_proposed": updated,
+                    **(details or {}),
+                },
+                store=self.store,
+            )
+            # Return to confirmation once validation pulse finishes.
+            if session.status == "validating":
+                session.status = (
+                    "blocked_destructive"
+                    if session.block_reason
+                    else "awaiting_confirmation"
+                )
+            session.updated_at = utc_now_iso()
+            self._maybe_publish_session(session)
+            self._maybe_publish_audit(event)
+            return revision
+
+    def apply_cloud_command(self, command: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Execute a remote commissioning command from cloud claim.
+
+        Supported types: start, discover, propose, confirm, cancel,
+        suggested_layout (read-only helper). validate_position is handled by
+        the HTTP layer because it needs async motor/ToF access.
+        """
+        cmd_type = str(command.get("type") or "").strip().lower()
+        payload = command.get("payload") or {}
+        actor = command.get("actor") or payload.get("actor")
+
+        if cmd_type == "start":
+            session = self.start(
+                technician_actor=actor or payload.get("technician_actor")
+            )
+            return {"session": session.to_dict()}
+
+        if cmd_type == "discover":
+            snapshot = self.discover()
+            return {
+                "discovery": snapshot.to_dict(),
+                "suggested_shelves": self.suggested_layout_from_discovery(),
+            }
+
+        if cmd_type == "suggested_layout":
+            return {"shelves": self.suggested_layout_from_discovery()}
+
+        if cmd_type == "propose":
+            shelves = payload.get("shelves") or []
+            revision = self.propose_layout(
+                shelves,
+                existing_planogram_slot_ids=payload.get(
+                    "existing_planogram_slot_ids"
+                ),
+            )
+            return {
+                "proposed": revision.to_dict(),
+                "blocked": bool(
+                    revision.planogram_impact
+                    and revision.planogram_impact.destructive
+                ),
+            }
+
+        if cmd_type == "confirm":
+            revision = self.confirm(
+                force=bool(payload.get("force")),
+                actor=actor,
+            )
+            return {"active": revision.to_dict()}
+
+        if cmd_type == "cancel":
+            self.cancel(actor=actor)
+            return {"cancelled": True}
+
+        raise ValueError(f"Unsupported commissioning command type: {cmd_type}")
 
     def start(
         self,

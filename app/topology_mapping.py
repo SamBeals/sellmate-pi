@@ -168,3 +168,27 @@ def assign_legacy_slot_ids(
         )
         if hint:
             position.legacy_slot_id = hint
+
+
+def build_legacy_slot_map(
+    revision: TopologyRevision,
+) -> Dict[str, Dict[str, Any]]:
+    """
+    Compatibility map so vend / planogramSlots readers can keep using Sxx IDs.
+
+    Authoritative planogramSlots write-side remains an unresolved discovery
+    task; this adapter is read-side coexistence only.
+    """
+    mapping: Dict[str, Dict[str, Any]] = {}
+    for position in revision.all_positions():
+        if not position.legacy_slot_id or position.hardware is None:
+            continue
+        slot_id = normalize_legacy_slot_id(position.legacy_slot_id)
+        mapping[slot_id] = {
+            "slot_id": slot_id,
+            "position_id": position.position_id,
+            "shelf_id": position.shelf_id,
+            "bank": position.hardware.bank.upper(),
+            "mask": int(position.hardware.mask),
+        }
+    return mapping

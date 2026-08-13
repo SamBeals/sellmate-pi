@@ -5,6 +5,11 @@ Canonical document shapes the Pi produces and consumes. Cloud stores these
 under machines/{machineId}; the device keeps a local mirror of the active
 approved revision for vend resolution.
 
+Hybrid communication uses one topology domain:
+  - Local Wi-Fi: technician laptop/tablet → vend_api commissioning routes
+  - Remote: Pi publishes snapshots / polls commissioning commands ↔ cloud
+  - Dashboard reads cloud mirrors; touchscreen only sees out-of-service state
+
 Firestore paths (V1):
   machines/{machineId}/topology/active
   machines/{machineId}/topology/proposed

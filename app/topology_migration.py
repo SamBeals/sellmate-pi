@@ -3,6 +3,13 @@ Migration path from static SLOT_TO_MASK / legacy slot maps to V1 topology.
 
 Preserves legacy_slot_id values so existing planogramSlots and vend jobs keep
 working until a machine is explicitly commissioned/approved.
+
+PLANOgram WRITE-SIDE (FEATURE-013 discovery task): the authoritative current
+writer of lane/slot definitions and planogram assignments for deployed machines
+is still an unresolved factual unknown. This module and migrate_legacy_topology.py
+must NOT invent a write path or rewrite planogramSlots / inventory documents.
+Compatibility adapters only emit planogramSlots-shaped rows for cloud-side
+follow-up once ownership is identified.
 """
 
 from __future__ import annotations
@@ -97,8 +104,10 @@ def planogram_slot_compat_rows(
     """
     Emit planogramSlots-compatible rows for migration tooling.
 
-    Does not write Firestore (cloud owns writes). Preserves legacy_slot_id as
-    the document identity key used by existing inventory merges.
+    Does not write Firestore (cloud owns cloud writes). Does not claim
+    ownership of the planogram write-side — that source remains unresolved.
+    Preserves legacy_slot_id as the document identity key used by existing
+    inventory merges.
     """
     rows: List[Dict[str, Any]] = []
     for position in revision.all_positions():

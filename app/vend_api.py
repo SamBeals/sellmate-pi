@@ -28,8 +28,18 @@ from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel, Field, model_validator
 
 from commissioning import get_commissioning_service
+from commissioning_auth import (
+    can_view_diagnostics,
+    filter_status_payload,
+    normalize_role,
+    require_commissioning_role,
+    strip_discovery_diagnostics,
+    strip_revision_hardware,
+    ROLE_TECHNICIAN,
+    ROLE_VENDOR,
+)
 from topology_discovery import LiveBackend
-from topology_mapping import LEGACY_SLOT_TO_HW, resolve_hw
+from topology_mapping import LEGACY_SLOT_TO_HW, build_legacy_slot_map, resolve_hw
 from topology_store import get_topology_store
 
 
@@ -293,6 +303,7 @@ class VendSequenceRequest(BaseModel):
 class CommissioningStartRequest(BaseModel):
     technician_actor: Optional[str] = None
     pin: Optional[str] = None
+    role: Optional[str] = None
 
 
 class CommissioningProposePosition(BaseModel):
@@ -347,6 +358,7 @@ class ValidatePositionRequest(BaseModel):
         ge=0.02,
         le=1.0,
     )
+    position_id: Optional[str] = None
 
     @model_validator(mode="after")
     def validate_mask_single_bit(self):
@@ -369,6 +381,36 @@ def _require_api_key(x_api_key: Optional[str]) -> None:
             status_code=401,
             detail="Unauthorized",
         )
+
+
+def _resolve_request_role(
+    *,
+    x_sellmate_role: Optional[str] = None,
+    role: Optional[str] = None,
+    default: str = ROLE_VENDOR,
+) -> str:
+    return normalize_role(x_sellmate_role or role, default=default)
+
+
+def _require_commissioning_access(
+    *,
+    x_api_key: Optional[str],
+    x_sellmate_role: Optional[str] = None,
+    role: Optional[str] = None,
+    default_role: str = ROLE_TECHNICIAN,
+) -> str:
+    """API key + commissioning role for local Wi-Fi technician actions."""
+    _require_api_key(x_api_key)
+    try:
+        return require_commissioning_role(
+            _resolve_request_role(
+                x_sellmate_role=x_sellmate_role,
+                role=role,
+                default=default_role,
+            )
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
 
 
 def _require_customer_service_available() -> None:
@@ -1642,63 +1684,157 @@ async def vend_sequence(
 
 
 # =========================================================
-# FEATURE-013 commissioning (local boundary for kiosk)
+# FEATURE-013 commissioning (bounded local Wi-Fi + maintenance)
+#
+# Primary technician UX is sellmate-dashboard. This local surface supports:
+#   - laptop/tablet on the machine LAN (hybrid local path)
+#   - touchscreen maintenance/out-of-service reflection only
+# Remote path: Pi publishes to cloud + polls commissioning commands.
 # =========================================================
+
+@app.get("/maintenance/status")
+def maintenance_status():
+    """
+    Customer/touchscreen out-of-service contract.
+
+    No raw hardware identifiers. Intentionally unbound from technician role
+    so the kiosk can show maintenance copy while commissioning is active.
+    """
+    return get_commissioning_service().customer_maintenance_status()
+
 
 @app.get("/commissioning/status")
 def commissioning_status(
     x_api_key: Optional[str] = Header(default=None),
+    x_sellmate_role: Optional[str] = Header(default=None, alias="X-SellMate-Role"),
+    role: Optional[str] = None,
 ):
     _require_api_key(x_api_key)
-    return get_commissioning_service().status()
+    resolved = _resolve_request_role(
+        x_sellmate_role=x_sellmate_role,
+        role=role,
+        default=ROLE_TECHNICIAN,
+    )
+    return filter_status_payload(
+        get_commissioning_service().status(),
+        role=resolved,
+    )
 
 
 @app.get("/topology/active")
 def topology_active(
     x_api_key: Optional[str] = Header(default=None),
-    vendor_safe: bool = False,
+    x_sellmate_role: Optional[str] = Header(default=None, alias="X-SellMate-Role"),
+    vendor_safe: Optional[bool] = None,
+    role: Optional[str] = None,
 ):
-    """Return active approved topology. vendor_safe strips raw HW ids."""
+    """Return active approved topology. Vendors always get vendor-safe."""
+    _require_api_key(x_api_key)
+    resolved = _resolve_request_role(
+        x_sellmate_role=x_sellmate_role,
+        role=role,
+        default=ROLE_VENDOR,
+    )
+    active = get_topology_store().load_active()
+    if active is None:
+        return {"ok": True, "active": None, "commissioned": False, "role": resolved}
+
+    force_vendor_safe = vendor_safe is True or not can_view_diagnostics(resolved)
+    if vendor_safe is False and can_view_diagnostics(resolved):
+        force_vendor_safe = False
+    payload = (
+        active.vendor_safe_dict() if force_vendor_safe else active.to_dict()
+    )
+    return {
+        "ok": True,
+        "active": payload,
+        "commissioned": True,
+        "role": resolved,
+        "vendor_safe": force_vendor_safe,
+    }
+
+
+@app.get("/topology/slot_map")
+def topology_slot_map(
+    x_api_key: Optional[str] = Header(default=None),
+):
+    """
+    Legacy Sxx → hardware compatibility map from active topology.
+    Falls back to static map when the machine is not commissioned.
+    """
     _require_api_key(x_api_key)
     active = get_topology_store().load_active()
     if active is None:
-        return {"ok": True, "active": None, "commissioned": False}
-    payload = active.vendor_safe_dict() if vendor_safe else active.to_dict()
-    return {"ok": True, "active": payload, "commissioned": True}
+        return {
+            "ok": True,
+            "source": "legacy_static",
+            "revision_id": None,
+            "slot_map": {
+                slot_id: {
+                    "slot_id": slot_id,
+                    "bank": cfg["bank"],
+                    "mask": int(cfg["mask"]),
+                }
+                for slot_id, cfg in SLOT_TO_MASK.items()
+            },
+        }
+    return {
+        "ok": True,
+        "source": "active_topology",
+        "revision_id": active.revision_id,
+        "slot_map": build_legacy_slot_map(active),
+    }
 
 
 @app.get("/topology/audit")
 def topology_audit(
     x_api_key: Optional[str] = Header(default=None),
+    x_sellmate_role: Optional[str] = Header(default=None, alias="X-SellMate-Role"),
     limit: int = 50,
+    role: Optional[str] = None,
 ):
-    _require_api_key(x_api_key)
+    resolved = _require_commissioning_access(
+        x_api_key=x_api_key,
+        x_sellmate_role=x_sellmate_role,
+        role=role,
+    )
     events = get_topology_store().list_audit(limit=max(1, min(limit, 200)))
-    return {
-        "ok": True,
-        "events": [e.to_dict() for e in events],
-    }
+    payloads = []
+    for event in events:
+        data = event.to_dict()
+        if not can_view_diagnostics(resolved):
+            # trusted_vendor: keep summary, drop low-level details.
+            data = dict(data)
+            data["details"] = {}
+        payloads.append(data)
+    return {"ok": True, "events": payloads, "role": resolved}
 
 
 @app.post("/commissioning/start")
 def commissioning_start(
     req: CommissioningStartRequest,
     x_api_key: Optional[str] = Header(default=None),
+    x_sellmate_role: Optional[str] = Header(default=None, alias="X-SellMate-Role"),
 ):
-    """Enter technician commissioning mode (kiosk out of service)."""
-    _require_api_key(x_api_key)
+    """Enter commissioning mode (machine out of service for customers)."""
+    resolved = _require_commissioning_access(
+        x_api_key=x_api_key,
+        x_sellmate_role=x_sellmate_role,
+        role=req.role,
+    )
     if TECHNICIAN_PIN and (req.pin or "") != TECHNICIAN_PIN:
         raise HTTPException(status_code=401, detail="Invalid technician PIN")
 
     try:
         session = get_commissioning_service().start(
-            technician_actor=req.technician_actor,
+            technician_actor=req.technician_actor or resolved,
         )
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     return {
         "ok": True,
+        "role": resolved,
         "session": session.to_dict(),
         "out_of_service": True,
         "customer_message": (
@@ -1710,21 +1846,62 @@ def commissioning_start(
 @app.post("/commissioning/discover")
 def commissioning_discover(
     x_api_key: Optional[str] = Header(default=None),
+    x_sellmate_role: Optional[str] = Header(default=None, alias="X-SellMate-Role"),
+    role: Optional[str] = None,
 ):
-    _require_api_key(x_api_key)
+    resolved = _require_commissioning_access(
+        x_api_key=x_api_key,
+        x_sellmate_role=x_sellmate_role,
+        role=role,
+    )
     try:
-        snapshot = get_commissioning_service().discover()
+        service = get_commissioning_service()
+        snapshot = service.discover()
+        suggested = service.suggested_layout_from_discovery()
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    return {"ok": True, "discovery": snapshot.to_dict()}
+
+    discovery = snapshot.to_dict()
+    if not can_view_diagnostics(resolved):
+        discovery = strip_discovery_diagnostics(discovery)
+    return {
+        "ok": True,
+        "role": resolved,
+        "discovery": discovery,
+        "suggested_shelves": suggested,
+    }
+
+
+@app.get("/commissioning/suggested_layout")
+def commissioning_suggested_layout(
+    x_api_key: Optional[str] = Header(default=None),
+    x_sellmate_role: Optional[str] = Header(default=None, alias="X-SellMate-Role"),
+    role: Optional[str] = None,
+):
+    _require_commissioning_access(
+        x_api_key=x_api_key,
+        x_sellmate_role=x_sellmate_role,
+        role=role,
+    )
+    try:
+        shelves = get_commissioning_service().suggested_layout_from_discovery()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"ok": True, "shelves": shelves}
 
 
 @app.post("/commissioning/propose")
 def commissioning_propose(
     req: CommissioningProposeRequest,
     x_api_key: Optional[str] = Header(default=None),
+    x_sellmate_role: Optional[str] = Header(default=None, alias="X-SellMate-Role"),
+    role: Optional[str] = None,
 ):
-    _require_api_key(x_api_key)
+    resolved = _require_commissioning_access(
+        x_api_key=x_api_key,
+        x_sellmate_role=x_sellmate_role,
+        role=role,
+    )
     shelves = []
     for shelf in req.shelves:
         shelves.append(
@@ -1743,9 +1920,13 @@ def commissioning_propose(
     except (RuntimeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    proposed = revision.to_dict()
+    if not can_view_diagnostics(resolved):
+        proposed = strip_revision_hardware(proposed)
     return {
         "ok": True,
-        "proposed": revision.to_dict(),
+        "role": resolved,
+        "proposed": proposed,
         "blocked": bool(
             revision.planogram_impact and revision.planogram_impact.destructive
         ),
@@ -1756,19 +1937,29 @@ def commissioning_propose(
 def commissioning_confirm(
     req: CommissioningConfirmRequest,
     x_api_key: Optional[str] = Header(default=None),
+    x_sellmate_role: Optional[str] = Header(default=None, alias="X-SellMate-Role"),
+    role: Optional[str] = None,
 ):
-    _require_api_key(x_api_key)
+    resolved = _require_commissioning_access(
+        x_api_key=x_api_key,
+        x_sellmate_role=x_sellmate_role,
+        role=role,
+    )
     try:
         revision = get_commissioning_service().confirm(
             force=req.force,
-            actor=req.actor,
+            actor=req.actor or resolved,
         )
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
+    active = revision.to_dict()
+    if not can_view_diagnostics(resolved):
+        active = strip_revision_hardware(active)
     return {
         "ok": True,
-        "active": revision.to_dict(),
+        "role": resolved,
+        "active": active,
         "out_of_service": False,
     }
 
@@ -1776,8 +1967,14 @@ def commissioning_confirm(
 @app.post("/commissioning/cancel")
 def commissioning_cancel(
     x_api_key: Optional[str] = Header(default=None),
+    x_sellmate_role: Optional[str] = Header(default=None, alias="X-SellMate-Role"),
+    role: Optional[str] = None,
 ):
-    _require_api_key(x_api_key)
+    _require_commissioning_access(
+        x_api_key=x_api_key,
+        x_sellmate_role=x_sellmate_role,
+        role=role,
+    )
     get_commissioning_service().cancel()
     return {"ok": True, "out_of_service": False}
 
@@ -1786,12 +1983,18 @@ def commissioning_cancel(
 async def commissioning_validate_position(
     req: ValidatePositionRequest,
     x_api_key: Optional[str] = Header(default=None),
+    x_sellmate_role: Optional[str] = Header(default=None, alias="X-SellMate-Role"),
+    role: Optional[str] = None,
 ):
     """
     Technician lane validation without a sale: pulse + ToF (preferred).
     Requires an active commissioning session.
     """
-    _require_api_key(x_api_key)
+    resolved = _require_commissioning_access(
+        x_api_key=x_api_key,
+        x_sellmate_role=x_sellmate_role,
+        role=role,
+    )
     service = get_commissioning_service()
     if not service.out_of_service:
         raise HTTPException(
@@ -1837,23 +2040,23 @@ async def commissioning_validate_position(
         finally:
             clear_vend_outputs_safe()
 
-    from topology_audit import record_audit_event
-
-    session = service.status().get("session") or {}
-    record_audit_event(
-        machine_id=session.get("machine_id") or os.getenv("MACHINE_ID") or "",
-        event_type="validation_result",
-        summary=(
-            "Position validation "
-            f"{'passed' if result.get('verified') else 'completed'}"
-        ),
-        session_id=session.get("session_id"),
-        details={
-            "bank": req.bank.upper(),
-            "mask": req.mask,
-            "verified": bool(result.get("verified")),
-            "verification_type": result.get("verification_type"),
-        },
-        store=get_topology_store(),
+    proposed = service.record_validation_result(
+        bank=req.bank,
+        mask=req.mask,
+        verified=bool(result.get("verified")),
+        verification_type=result.get("verification_type"),
+        details={"position_id": req.position_id, "role": resolved},
     )
-    return {"ok": True, "validation": result}
+    proposed_payload = None
+    if proposed is not None:
+        proposed_payload = (
+            proposed.to_dict()
+            if can_view_diagnostics(resolved)
+            else strip_revision_hardware(proposed.to_dict())
+        )
+    return {
+        "ok": True,
+        "role": resolved,
+        "validation": result,
+        "proposed": proposed_payload,
+    }
