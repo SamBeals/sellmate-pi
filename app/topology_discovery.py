@@ -19,6 +19,7 @@ from typing import Any, Callable, Dict, List, Optional, Protocol
 from topology_mapping import default_candidates, legacy_slot_for_hw
 from topology_schemas import (
     SCHEMA_VERSION,
+    CurrentMonitorSnapshot,
     DiscoveredMotor,
     DiscoverySnapshot,
     SensingSnapshot,
@@ -33,6 +34,8 @@ class MotorProbeBackend(Protocol):
     def probe_channel(self, bank: str, mask: int) -> Dict[str, Any]: ...
 
     def sensing_status(self) -> SensingSnapshot: ...
+
+    def current_monitor_status(self) -> CurrentMonitorSnapshot: ...
 
 
 @dataclass
@@ -55,11 +58,24 @@ class SimulationBackend:
             return {
                 "addressable": False,
                 "probe_ok": False,
+                "electrically_detected": False,
+                "probe_result": "not_in_fixture",
                 "diagnostics": {"reason": "not_in_fixture"},
             }
+        electrically = bool(
+            hit.get("electrically_detected", hit.get("probe_ok", True))
+        )
+        probe_ok = bool(hit.get("probe_ok", electrically))
         return {
             "addressable": bool(hit.get("addressable", True)),
-            "probe_ok": bool(hit.get("probe_ok", True)),
+            "probe_ok": probe_ok,
+            "electrically_detected": electrically,
+            "probe_result": str(
+                hit.get("probe_result")
+                or ("current_response" if electrically else "no_current")
+            ),
+            "activation_latency_ms": hit.get("activation_latency_ms"),
+            "activation_duration_ms": hit.get("activation_duration_ms"),
             "diagnostics": dict(hit.get("diagnostics") or {"source": "simulation"}),
             "legacy_slot_hint": hit.get("legacy_slot_hint"),
             "label_hint": hit.get("label_hint"),
@@ -86,15 +102,28 @@ class SimulationBackend:
             preferred_verification=str(preferred),
         )
 
+    def current_monitor_status(self) -> CurrentMonitorSnapshot:
+        raw = self.fixture.get("current_monitor") or {}
+        return CurrentMonitorSnapshot(
+            available=bool(raw.get("available", True)),
+            enabled=bool(raw.get("enabled", True)),
+            address=raw.get("address") or "0x40",
+            bus=raw.get("bus") or "1",
+            reason=raw.get("reason"),
+            manufacturer_id=raw.get("manufacturer_id") or "0x5449",
+        )
+
 
 @dataclass
 class LiveBackend:
     """
     Live probe using injectable callables from vend_api.
 
-    Channel presence: controller must be ready; a non-raising readiness check
-    marks the channel addressable. True mechanical confirmation uses
-    validate_position (pulse + ToF) during commissioning.
+    Electrical presence: command exactly one MOSFET channel and observe the
+    shared INA226 on the common +24 V feed. The sensor does not identify
+    the channel; SellMate does because it commanded one output at a time.
+
+    ToF remains a separate physical-drop check (validate_position / vend).
     """
 
     ensure_controller: Callable[[], None]
@@ -104,6 +133,11 @@ class LiveBackend:
     beam_error: Callable[[], Optional[str]]
     i2c_bus: str = "1"
     i2c_address: str = "0x27"
+    command_channel: Optional[Callable[[str, int, float], None]] = None
+    deenergize_all: Optional[Callable[[], None]] = None
+    current_monitor: Any = None
+    probe_pulse_seconds: float = 0.75
+    require_current_sensor: bool = True
 
     def controller_present(self) -> bool:
         try:
@@ -112,29 +146,115 @@ class LiveBackend:
         except Exception:
             return False
 
+    def current_monitor_status(self) -> CurrentMonitorSnapshot:
+        monitor = self.current_monitor
+        if monitor is None:
+            return CurrentMonitorSnapshot(
+                available=False,
+                enabled=False,
+                reason="not_configured",
+            )
+        cap = monitor.capability()
+        return CurrentMonitorSnapshot(
+            available=bool(cap.available),
+            enabled=bool(cap.enabled),
+            address=cap.address,
+            bus=cap.bus,
+            reason=cap.reason,
+            manufacturer_id=cap.manufacturer_id,
+        )
+
+    def _safe_deenergize(self) -> None:
+        if self.deenergize_all is None:
+            return
+        try:
+            self.deenergize_all()
+        except Exception:
+            pass
+
     def probe_channel(self, bank: str, mask: int) -> Dict[str, Any]:
+        base = {
+            "controller": "mcp23017",
+            "i2c_bus": self.i2c_bus,
+            "i2c_address": self.i2c_address,
+            "bank": str(bank).upper(),
+            "mask": int(mask),
+        }
         if not self.controller_present():
             return {
                 "addressable": False,
                 "probe_ok": False,
-                "diagnostics": {"reason": "controller_unavailable"},
+                "electrically_detected": False,
+                "probe_result": "controller_unavailable",
+                "diagnostics": {**base, "reason": "controller_unavailable"},
             }
-        # MCP23017 accepts all configured output bits; addressable means the
-        # controller is ready to drive this channel. Mechanical presence is
-        # confirmed via technician validation (ToF), not inferred here.
+
+        monitor_status = self.current_monitor_status()
+        pulse_s = min(2.0, max(0.2, float(self.probe_pulse_seconds)))
+        if not monitor_status.available or self.command_channel is None:
+            return {
+                "addressable": True,
+                "probe_ok": False,
+                "electrically_detected": False,
+                "probe_result": "current_monitor_unavailable",
+                "diagnostics": {
+                    **base,
+                    "reason": monitor_status.reason or "current_monitor_unavailable",
+                    "current_monitor": monitor_status.to_dict(),
+                    "note": (
+                        "Channel is addressable on the motor controller, but "
+                        "electrical auto-discovery requires the INA226 current "
+                        "monitor. No motor was energized."
+                    ),
+                },
+            }
+
+        energized = {"on": False}
+
+        def command() -> None:
+            try:
+                energized["on"] = True
+                assert self.command_channel is not None
+                self.command_channel(str(bank).upper(), int(mask), pulse_s)
+            finally:
+                energized["on"] = False
+                self._safe_deenergize()
+
+        try:
+            evidence = self.current_monitor.observe_blocking(
+                command,
+                expected_window_s=pulse_s,
+            )
+        except Exception as exc:
+            self._safe_deenergize()
+            return {
+                "addressable": True,
+                "probe_ok": False,
+                "electrically_detected": False,
+                "probe_result": "probe_error",
+                "diagnostics": {**base, "reason": str(exc)},
+            }
+        finally:
+            if energized["on"]:
+                self._safe_deenergize()
+
+        detected = bool(evidence.electrically_active)
+        probe_result = (
+            "current_response" if detected else "no_current"
+        )
+        if evidence.classification == "current_monitor_unavailable":
+            probe_result = "current_monitor_unavailable"
         return {
             "addressable": True,
-            "probe_ok": True,
+            "probe_ok": detected,
+            "electrically_detected": detected,
+            "probe_result": probe_result,
+            "activation_latency_ms": evidence.activation_latency_ms,
+            "activation_duration_ms": evidence.motor_runtime_ms,
             "diagnostics": {
-                "controller": "mcp23017",
-                "i2c_bus": self.i2c_bus,
-                "i2c_address": self.i2c_address,
-                "bank": bank.upper(),
-                "mask": int(mask),
-                "note": (
-                    "Channel is addressable on the motor controller; "
-                    "confirm mechanical presence via validation."
-                ),
+                **base,
+                "current_monitor": monitor_status.to_dict(),
+                "evidence": evidence.to_dict(),
             },
         }
 
@@ -199,11 +319,18 @@ def run_discovery(
     cand = candidates or default_candidates()
     controller_ok = backend.controller_present()
     sensing = backend.sensing_status()
+    current_monitor = backend.current_monitor_status()
     motors: List[DiscoveredMotor] = []
     notes: List[str] = []
 
     if not controller_ok:
         notes.append("Motor controller not detected; no channels probed.")
+    if not simulation and not current_monitor.available:
+        notes.append(
+            "INA226 current monitor unavailable; electrical auto-discovery "
+            "cannot confirm motor circuits. "
+            f"reason={current_monitor.reason or 'device_not_found'}."
+        )
 
     for item in cand:
         bank = str(item.get("bank", "A")).upper()
@@ -214,6 +341,8 @@ def run_discovery(
             else {
                 "addressable": False,
                 "probe_ok": False,
+                "electrically_detected": False,
+                "probe_result": "controller_unavailable",
                 "diagnostics": {"reason": "controller_unavailable"},
             }
         )
@@ -223,7 +352,17 @@ def run_discovery(
         if not legacy_hint:
             legacy_hint = legacy_slot_for_hw(bank, mask)
         label_hint = item.get("label_hint") or result.get("label_hint") or legacy_hint
-        if result.get("addressable") or result.get("probe_ok"):
+        electrically = bool(result.get("electrically_detected", False))
+        probe_result = str(result.get("probe_result") or "unknown")
+        # Include addressable and electrically responding channels so
+        # technicians can see both hits and misses. Suggested layout later
+        # filters to electrically_detected.
+        if (
+            result.get("addressable")
+            or result.get("probe_ok")
+            or electrically
+            or probe_result not in ("not_in_fixture",)
+        ) and probe_result != "not_in_fixture":
             motors.append(
                 DiscoveredMotor(
                     discovery_id=new_id("mot"),
@@ -231,11 +370,20 @@ def run_discovery(
                     mask=mask,
                     addressable=bool(result.get("addressable")),
                     probe_ok=bool(result.get("probe_ok")),
+                    electrically_detected=electrically,
+                    probe_result=probe_result,
+                    activation_latency_ms=result.get("activation_latency_ms"),
+                    activation_duration_ms=result.get("activation_duration_ms"),
                     label_hint=label_hint,
                     legacy_slot_hint=legacy_hint,
                     diagnostics=dict(result.get("diagnostics") or {}),
                 )
             )
+
+    detected = sum(1 for m in motors if m.electrically_detected)
+    notes.append(
+        f"Electrically responding motor circuits: {detected}/{len(motors)}."
+    )
 
     if sensing.preferred_verification == "none":
         notes.append(
@@ -253,6 +401,7 @@ def run_discovery(
         motor_controller_present=controller_ok,
         motors=motors,
         sensing=sensing,
+        current_monitor=current_monitor,
         candidate_count=len(cand),
         simulation=simulation,
         notes=notes,

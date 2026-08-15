@@ -28,6 +28,7 @@ from commissioning_auth import (  # noqa: E402
     require_commissioning_role,
 )
 from topology_discovery import (  # noqa: E402
+    LiveBackend,
     SimulationBackend,
     load_simulation_fixture,
     run_discovery,
@@ -106,6 +107,8 @@ class TestDiscoverySimulation(unittest.TestCase):
         self.assertEqual(len(snapshot.motors), 6)
         self.assertEqual(snapshot.sensing.preferred_verification, "tof")
         self.assertTrue(snapshot.simulation)
+        self.assertTrue(all(m.electrically_detected for m in snapshot.motors))
+        self.assertTrue(snapshot.current_monitor.available)
 
 
 class TestMigration(unittest.TestCase):
@@ -381,6 +384,115 @@ class TestCloudPollerResolution(unittest.TestCase):
         # Cleanup env singleton for other tests.
         ts._STORE = None
         os.environ.pop("SELLMATE_TOPOLOGY_DIR", None)
+
+
+class TestLiveElectricalDiscovery(unittest.TestCase):
+    def _backend(self, *, detect_masks, monitor_available=True, command_error=None):
+        from current_monitor import (
+            CurrentMonitorCapability,
+            MotorCurrentEvidence,
+        )
+
+        log = []
+
+        def command_channel(bank, mask, seconds):
+            log.append(("on", bank, int(mask), float(seconds)))
+            if command_error:
+                raise command_error
+
+        def deenergize_all():
+            log.append(("off", None, None, None))
+
+        class FakeMonitor:
+            def capability(self):
+                if not monitor_available:
+                    return CurrentMonitorCapability(
+                        available=False,
+                        enabled=True,
+                        address="0x40",
+                        bus="1",
+                        reason="device_not_found",
+                    )
+                return CurrentMonitorCapability(
+                    available=True,
+                    enabled=True,
+                    address="0x40",
+                    bus="1",
+                    manufacturer_id="0x5449",
+                )
+
+            def observe_blocking(self, command_fn, expected_window_s=0.0, motor_commanded=True):
+                command_fn()
+                ons = [item for item in log if item[0] == "on"]
+                mask = ons[-1][2] if ons else None
+                detected = mask in detect_masks
+                return MotorCurrentEvidence(
+                    motor_commanded=True,
+                    motor_current_detected=detected,
+                    electrically_active=detected,
+                    sensor_available=True,
+                    classification=(
+                        "motor_current_confirmed" if detected else "motor_no_current"
+                    ),
+                    activation_latency_ms=50 if detected else None,
+                    motor_runtime_ms=700 if detected else None,
+                )
+
+        backend = LiveBackend(
+            ensure_controller=lambda: None,
+            tof_available=lambda: True,
+            tof_error=lambda: None,
+            beam_available=lambda: False,
+            beam_error=lambda: None,
+            command_channel=command_channel,
+            deenergize_all=deenergize_all,
+            current_monitor=FakeMonitor(),
+            probe_pulse_seconds=0.2,
+        )
+        return backend, log
+
+    def test_current_response_marks_channel_present(self):
+        backend, log = self._backend(detect_masks={1})
+        snapshot = run_discovery(
+            machine_id="machine_test",
+            backend=backend,
+            candidates=[
+                {"bank": "A", "mask": 1, "legacy_slot_hint": "S01"},
+                {"bank": "A", "mask": 2, "legacy_slot_hint": "S02"},
+            ],
+            simulation=False,
+        )
+        by_mask = {m.mask: m for m in snapshot.motors}
+        self.assertTrue(by_mask[1].electrically_detected)
+        self.assertEqual(by_mask[1].probe_result, "current_response")
+        self.assertFalse(by_mask[2].electrically_detected)
+        self.assertEqual(by_mask[2].probe_result, "no_current")
+        self.assertIn(("off", None, None, None), log)
+        self.assertEqual(log.count(("on", "A", 1, 0.2)), 1)
+        self.assertEqual(log.count(("on", "A", 2, 0.2)), 1)
+
+    def test_missing_sensor_does_not_energize(self):
+        backend, log = self._backend(detect_masks={1}, monitor_available=False)
+        snapshot = run_discovery(
+            machine_id="machine_test",
+            backend=backend,
+            candidates=[{"bank": "A", "mask": 1, "legacy_slot_hint": "S01"}],
+            simulation=False,
+        )
+        self.assertEqual(log, [])
+        self.assertFalse(snapshot.motors[0].electrically_detected)
+        self.assertEqual(snapshot.motors[0].probe_result, "current_monitor_unavailable")
+        self.assertFalse(snapshot.current_monitor.available)
+
+    def test_command_error_still_deenergizes(self):
+        backend, log = self._backend(
+            detect_masks={1},
+            command_error=RuntimeError("i2c write failed"),
+        )
+        result = backend.probe_channel("A", 1)
+        self.assertFalse(result["electrically_detected"])
+        self.assertEqual(result["probe_result"], "probe_error")
+        self.assertIn(("off", None, None, None), log)
 
 
 if __name__ == "__main__":

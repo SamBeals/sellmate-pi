@@ -168,6 +168,32 @@ class TopologyShelf:
 
 
 @dataclass
+class CurrentMonitorSnapshot:
+    """Capability of the shared INA226 motor-current monitor."""
+
+    available: bool
+    enabled: bool = True
+    address: Optional[str] = None
+    bus: Optional[str] = None
+    reason: Optional[str] = None
+    manufacturer_id: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "CurrentMonitorSnapshot":
+        return cls(
+            available=bool(data.get("available", False)),
+            enabled=bool(data.get("enabled", True)),
+            address=data.get("address"),
+            bus=data.get("bus"),
+            reason=data.get("reason"),
+            manufacturer_id=data.get("manufacturer_id"),
+        )
+
+
+@dataclass
 class SensingSnapshot:
     """Vend-verification sensing required for lane validation (V1: ToF first)."""
 
@@ -206,6 +232,10 @@ class DiscoveredMotor:
     probe_ok: bool
     label_hint: Optional[str] = None
     legacy_slot_hint: Optional[str] = None
+    electrically_detected: bool = False
+    probe_result: str = "unknown"
+    activation_latency_ms: Optional[int] = None
+    activation_duration_ms: Optional[int] = None
     diagnostics: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -215,6 +245,10 @@ class DiscoveredMotor:
             "mask": int(self.mask),
             "addressable": bool(self.addressable),
             "probe_ok": bool(self.probe_ok),
+            "electrically_detected": bool(self.electrically_detected),
+            "probe_result": self.probe_result,
+            "activation_latency_ms": self.activation_latency_ms,
+            "activation_duration_ms": self.activation_duration_ms,
             "label_hint": self.label_hint,
             "legacy_slot_hint": self.legacy_slot_hint,
             "diagnostics": dict(self.diagnostics),
@@ -222,14 +256,26 @@ class DiscoveredMotor:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "DiscoveredMotor":
+        probe_ok = bool(data.get("probe_ok", False))
+        if "electrically_detected" in data:
+            electrically = bool(data.get("electrically_detected"))
+        else:
+            electrically = probe_ok
+        probe_result = str(data.get("probe_result") or "")
+        if not probe_result:
+            probe_result = "current_response" if electrically else "unknown"
         return cls(
             discovery_id=str(data["discovery_id"]),
             bank=str(data.get("bank", "A")).upper(),
             mask=int(data["mask"]),
             addressable=bool(data.get("addressable", False)),
-            probe_ok=bool(data.get("probe_ok", False)),
+            probe_ok=probe_ok,
             label_hint=data.get("label_hint"),
             legacy_slot_hint=data.get("legacy_slot_hint"),
+            electrically_detected=electrically,
+            probe_result=probe_result,
+            activation_latency_ms=data.get("activation_latency_ms"),
+            activation_duration_ms=data.get("activation_duration_ms"),
             diagnostics=dict(data.get("diagnostics") or {}),
         )
 
@@ -245,6 +291,7 @@ class DiscoverySnapshot:
     candidate_count: int
     simulation: bool = False
     notes: List[str] = field(default_factory=list)
+    current_monitor: Optional[CurrentMonitorSnapshot] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -254,6 +301,9 @@ class DiscoverySnapshot:
             "motor_controller_present": self.motor_controller_present,
             "motors": [m.to_dict() for m in self.motors],
             "sensing": self.sensing.to_dict(),
+            "current_monitor": (
+                self.current_monitor.to_dict() if self.current_monitor else None
+            ),
             "candidate_count": int(self.candidate_count),
             "simulation": bool(self.simulation),
             "notes": list(self.notes),
@@ -261,6 +311,7 @@ class DiscoverySnapshot:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "DiscoverySnapshot":
+        current = data.get("current_monitor")
         return cls(
             schema_version=int(data.get("schema_version", SCHEMA_VERSION)),
             machine_id=str(data.get("machine_id") or ""),
@@ -275,6 +326,11 @@ class DiscoverySnapshot:
             candidate_count=int(data.get("candidate_count", 0)),
             simulation=bool(data.get("simulation", False)),
             notes=list(data.get("notes") or []),
+            current_monitor=(
+                CurrentMonitorSnapshot.from_dict(current)
+                if isinstance(current, dict)
+                else None
+            ),
         )
 
 

@@ -43,6 +43,7 @@ APP_VERSION_OVERRIDE = os.getenv("APP_VERSION", "").strip()
 I2C_BUS = os.getenv("I2C_BUS", "1")
 MCP23017_ADDR = os.getenv("I2C_ADDR", "0x27").lower()
 TOF_ADDR = os.getenv("TOF_I2C_ADDR", "0x29").lower()
+INA226_ADDR = os.getenv("INA226_I2C_ADDRESS", "0x40").lower()
 
 VEND_API_UNIT = os.getenv("VEND_API_UNIT", "vend-api.service")
 POLLER_UNIT = os.getenv("POLLER_UNIT", "sellmate-poller.service")
@@ -287,6 +288,7 @@ def build_health_payload(
     i2c_devices = [normalize_addr(a) for a in (i2c_fn() or [])]
     mcp = normalize_addr(MCP23017_ADDR)
     tof = normalize_addr(TOF_ADDR)
+    ina = normalize_addr(INA226_ADDR)
 
     payload = {
         "schema_version": 1,
@@ -315,6 +317,8 @@ def build_health_payload(
             "i2c_devices": i2c_devices,
             "tof_connected": tof in i2c_devices,
             "motor_controller_connected": mcp in i2c_devices,
+            "current_monitor_connected": ina in i2c_devices,
+            "current_monitor_address": ina,
         },
         "errors": errors,
     }

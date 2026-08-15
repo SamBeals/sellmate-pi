@@ -68,7 +68,7 @@ class TestHealthPayload(unittest.TestCase):
             "cpu_percent": lambda: 12.4,
             "memory": lambda: 38.1,
             "disk": lambda: 31.0,
-            "i2c": lambda: ["0x27", "0x29"],
+            "i2c": lambda: ["0x27", "0x29", "0x40"],
             "local_ip": lambda: "192.168.1.20",
             "tailscale": lambda: "100.64.0.5",
             "internet": lambda: True,
@@ -89,6 +89,7 @@ class TestHealthPayload(unittest.TestCase):
         self.assertEqual(payload["system"]["uptime_seconds"], 12345.0)
         self.assertTrue(payload["hardware"]["tof_connected"])
         self.assertTrue(payload["hardware"]["motor_controller_connected"])
+        self.assertTrue(payload["hardware"]["current_monitor_connected"])
         self.assertEqual(payload["errors"], [])
         blob = str(payload)
         self.assertNotIn("MACHINE_SHARED_TOKEN", blob)
@@ -114,6 +115,7 @@ class TestHealthPayload(unittest.TestCase):
         payload = hr.build_health_payload(collectors=collectors)
         self.assertFalse(payload["hardware"]["tof_connected"])
         self.assertFalse(payload["hardware"]["motor_controller_connected"])
+        self.assertFalse(payload["hardware"]["current_monitor_connected"])
         self.assertFalse(payload["services"]["vend_api_running"])
 
     def test_collector_failures_go_to_errors(self):

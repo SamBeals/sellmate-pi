@@ -15,6 +15,13 @@ Environment=TOF_WAIT_SECONDS=2.0
 Environment=TOF_DROP_THRESHOLD_CM=4.0
 Environment=TOF_CONSECUTIVE_HITS=2
 Environment=TOF_SAMPLE_INTERVAL_SECONDS=0.1
+Environment=INA226_ENABLED=true
+Environment=INA226_I2C_BUS=1
+Environment=INA226_I2C_ADDRESS=0x40
+Environment=CURRENT_SAMPLE_INTERVAL_MS=50
+Environment=CURRENT_DETECTION_THRESHOLD_V=0.002
+Environment=CURRENT_REQUIRED_SAMPLES=3
+Environment=COMMISSIONING_PROBE_SECONDS=0.75
 ExecStart=/home/sambeals/sellmate-pi/.venv/bin/uvicorn vend_api:app --host 0.0.0.0 --port 8000
 Restart=always
 RestartSec=2

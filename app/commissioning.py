@@ -112,7 +112,13 @@ class CommissioningService:
             session = self._require_session()
             if session.discovery is None:
                 raise RuntimeError("Run discovery before suggesting a layout")
-            motors = list(session.discovery.motors)
+            motors = [
+                m
+                for m in list(session.discovery.motors)
+                if m.electrically_detected or (
+                    session.discovery.simulation and m.probe_ok
+                )
+            ]
             return [
                 {
                     "shelf_id": "shelf_1",

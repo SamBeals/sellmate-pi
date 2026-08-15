@@ -21,6 +21,7 @@ import asyncio
 import os
 import re
 import subprocess
+import time
 import traceback
 from typing import Optional, List, Dict, Any, Tuple
 
@@ -38,9 +39,15 @@ from commissioning_auth import (
     ROLE_TECHNICIAN,
     ROLE_VENDOR,
 )
+from current_monitor import (
+    MotorCurrentEvidence,
+    get_current_monitor,
+    load_current_monitor_config,
+)
 from topology_discovery import LiveBackend
 from topology_mapping import LEGACY_SLOT_TO_HW, build_legacy_slot_map, resolve_hw
 from topology_store import get_topology_store
+from vend_evidence import merge_current_into_vend_result
 
 
 app = FastAPI(
@@ -84,6 +91,15 @@ TOF_SAMPLE_INTERVAL_SECONDS = float(
 )
 TOF_MIN_BASELINE_SAMPLES = int(os.getenv("TOF_MIN_BASELINE_SAMPLES", "3"))
 
+_CURRENT_CFG = load_current_monitor_config()
+INA226_ENABLED = bool(_CURRENT_CFG["enabled"])
+INA226_I2C_BUS = str(_CURRENT_CFG["i2c_bus"])
+INA226_I2C_ADDRESS = f"{int(_CURRENT_CFG['i2c_address']):#x}"
+COMMISSIONING_PROBE_SECONDS = float(_CURRENT_CFG["probe_pulse_s"])
+COMMISSIONING_REQUIRE_CURRENT_SENSOR = bool(
+    _CURRENT_CFG["require_for_discovery"]
+)
+
 API_KEY = os.getenv("VEND_API_KEY", "CHANGE_ME")
 
 SLOT_RE = re.compile(r"^S\d{2}$")
@@ -116,6 +132,9 @@ LIGHTS_ERROR: Optional[str] = None
 TOF_SENSOR = None
 TOF_AVAILABLE = False
 TOF_ERROR: Optional[str] = None
+
+CURRENT_MONITOR_AVAILABLE = False
+CURRENT_MONITOR_ERROR: Optional[str] = None
 
 
 # =========================================================
@@ -626,22 +645,25 @@ def clear_vend_outputs_safe() -> None:
             )
 
 
-async def _pulse_mask_once(
+def pulse_mask_once_sync(
     bank: str,
     mask: int,
     pulse_seconds: float,
 ) -> None:
+    """
+    Energize exactly one motor channel for pulse_seconds, then clear it.
+
+    Always de-energizes in finally so current-monitor or ToF errors cannot
+    leave a MOSFET output on.
+    """
     ensure_i2c_ready()
-
     pulse_register = _reg_for_bank(bank)
-
+    bounded = min(10.0, max(0.05, float(pulse_seconds)))
     try:
         i2cset(pulse_register, 0x00)
         i2cset(REG_ENABLE, 0x00)
         i2cset(pulse_register, mask)
-
-        await asyncio.sleep(pulse_seconds)
-
+        time.sleep(bounded)
     finally:
         try:
             i2cset(pulse_register, 0x00)
@@ -650,6 +672,24 @@ async def _pulse_mask_once(
                 f"[I2C] Failed to stop pulse on {pulse_register}: {e}",
                 flush=True,
             )
+        try:
+            i2cset(REG_PULSE_A, 0x00)
+            i2cset(REG_PULSE_B, 0x00)
+        except Exception as e:
+            print(f"[I2C] Failed to clear both pulse registers: {e}", flush=True)
+
+
+async def _pulse_mask_once(
+    bank: str,
+    mask: int,
+    pulse_seconds: float,
+) -> None:
+    await asyncio.to_thread(
+        pulse_mask_once_sync,
+        bank,
+        mask,
+        pulse_seconds,
+    )
 
 
 async def _pulse_mask_repeated(
@@ -670,6 +710,63 @@ async def _pulse_mask_repeated(
 
         if not is_last_pulse and gap_seconds > 0:
             await asyncio.sleep(gap_seconds)
+
+
+def _observe_current_during_command(
+    command_fn,
+    *,
+    expected_window_s: float,
+    motor_commanded: bool = True,
+) -> MotorCurrentEvidence:
+    monitor = get_current_monitor()
+    return monitor.observe_blocking(
+        command_fn,
+        expected_window_s=expected_window_s,
+        motor_commanded=motor_commanded,
+    )
+
+
+async def _pulse_mask_repeated_with_current(
+    bank: str,
+    mask: int,
+    pulses: int,
+    pulse_seconds: float,
+    gap_seconds: float,
+) -> MotorCurrentEvidence:
+    def command() -> None:
+        count = max(1, int(pulses))
+        for pulse_index in range(count):
+            pulse_mask_once_sync(bank, mask, pulse_seconds)
+            is_last_pulse = pulse_index == count - 1
+            if not is_last_pulse and gap_seconds > 0:
+                time.sleep(gap_seconds)
+
+    window_s = (
+        max(1, int(pulses)) * float(pulse_seconds)
+        + max(0, int(pulses) - 1) * float(gap_seconds)
+    )
+    return await asyncio.to_thread(
+        _observe_current_during_command,
+        command,
+        expected_window_s=window_s,
+        motor_commanded=True,
+    )
+
+
+async def _pulse_mask_once_with_current(
+    bank: str,
+    mask: int,
+    pulse_seconds: float,
+) -> MotorCurrentEvidence:
+    def command() -> None:
+        pulse_mask_once_sync(bank, mask, pulse_seconds)
+
+    return await asyncio.to_thread(
+        _observe_current_during_command,
+        command,
+        expected_window_s=float(pulse_seconds),
+        motor_commanded=True,
+    )
 
 
 # =========================================================
@@ -859,6 +956,44 @@ def ensure_tof_ready() -> None:
         )
 
 
+def init_current_monitor() -> bool:
+    """Identify INA226 if enabled. Missing hardware is non-fatal."""
+    global CURRENT_MONITOR_AVAILABLE
+    global CURRENT_MONITOR_ERROR
+
+    if not INA226_ENABLED:
+        CURRENT_MONITOR_AVAILABLE = False
+        CURRENT_MONITOR_ERROR = "current monitor disabled"
+        print("[INA226] Disabled", flush=True)
+        return False
+
+    try:
+        from current_monitor import build_current_monitor, set_current_monitor
+
+        monitor = build_current_monitor()
+        set_current_monitor(monitor)
+        cap = monitor.capability()
+        CURRENT_MONITOR_AVAILABLE = bool(cap.available)
+        CURRENT_MONITOR_ERROR = cap.reason
+        if cap.available:
+            print(
+                f"[INA226] Ready on bus {cap.bus} address {cap.address} "
+                f"id={cap.manufacturer_id}",
+                flush=True,
+            )
+        else:
+            print(
+                f"[INA226] Unavailable: {cap.reason}",
+                flush=True,
+            )
+        return CURRENT_MONITOR_AVAILABLE
+    except Exception as e:
+        CURRENT_MONITOR_AVAILABLE = False
+        CURRENT_MONITOR_ERROR = str(e)
+        print(f"[INA226] Init exception: {e}", flush=True)
+        return False
+
+
 async def _vend_with_tof_verification(
     req: VendMaskVerifiedRequest,
 ) -> Dict[str, Any]:
@@ -916,9 +1051,10 @@ async def _vend_with_tof_verification(
     )
 
     motor_activated = False
+    current_evidence: Optional[MotorCurrentEvidence] = None
 
     try:
-        await _pulse_mask_once(
+        current_evidence = await _pulse_mask_once_with_current(
             req.bank,
             req.mask,
             req.pulse_seconds,
@@ -947,7 +1083,7 @@ async def _vend_with_tof_verification(
             )
         )
 
-        return {
+        payload = {
             "ok": True,
             "mode": "vend_mask_verified",
             "bank": req.bank.upper(),
@@ -979,10 +1115,15 @@ async def _vend_with_tof_verification(
             "tof_wait_seconds": req.tof_wait_seconds,
             "tof_drop_threshold_cm": req.tof_drop_threshold_cm,
         }
+        return merge_current_into_vend_result(
+            payload,
+            current_evidence.to_dict() if current_evidence else None,
+            drop_verification_enabled=True,
+        )
 
     set_light_state_safe(STATE_IDLE)
 
-    return {
+    payload = {
         "ok": False,
         "mode": "vend_mask_verified",
         "bank": req.bank.upper(),
@@ -1019,6 +1160,11 @@ async def _vend_with_tof_verification(
         "tof_wait_seconds": req.tof_wait_seconds,
         "tof_drop_threshold_cm": req.tof_drop_threshold_cm,
     }
+    return merge_current_into_vend_result(
+        payload,
+        current_evidence.to_dict() if current_evidence else None,
+        drop_verification_enabled=True,
+    )
 
 
 # =========================================================
@@ -1067,10 +1213,16 @@ def startup() -> None:
         f"[STARTUP] TOF_VERIFICATION_ENABLED={TOF_VERIFICATION_ENABLED}",
         flush=True,
     )
+    print(
+        f"[STARTUP] INA226_ENABLED={INA226_ENABLED} "
+        f"address={INA226_I2C_ADDRESS} bus={INA226_I2C_BUS}",
+        flush=True,
+    )
 
     init_mcp23017()
     init_beam_gpio()
     init_tof_sensor()
+    init_current_monitor()
     set_light_state_safe(STATE_IDLE)
 
     # Wire live discovery backend for technician commissioning.
@@ -1083,6 +1235,11 @@ def startup() -> None:
         beam_error=lambda: GPIO_ERROR,
         i2c_bus=str(I2C_BUS),
         i2c_address=str(I2C_ADDR),
+        command_channel=pulse_mask_once_sync,
+        deenergize_all=clear_vend_outputs_safe,
+        current_monitor=get_current_monitor(),
+        probe_pulse_seconds=COMMISSIONING_PROBE_SECONDS,
+        require_current_sensor=COMMISSIONING_REQUIRE_CURRENT_SENSOR,
     )
     # Avoid blocking API startup on cloud publish failures during local ops.
     if os.getenv("COMMISSIONING_CLOUD_PUBLISH", "true").lower() == "false":
@@ -1157,6 +1314,7 @@ def health():
             "sample_interval_seconds": TOF_SAMPLE_INTERVAL_SECONDS,
             "error": TOF_ERROR,
         },
+        "current_monitor": get_current_monitor().capability().to_dict(),
         "lights": {
             "available": LIGHTS_AVAILABLE,
             "error": LIGHTS_ERROR,
@@ -1182,9 +1340,10 @@ def reinitialize_hardware(
     i2c_ok = init_mcp23017()
     gpio_ok = init_beam_gpio()
     tof_ok = init_tof_sensor() if TOF_VERIFICATION_ENABLED else False
+    current_ok = init_current_monitor() if INA226_ENABLED else False
 
     return {
-        "ok": i2c_ok or gpio_ok or tof_ok,
+        "ok": i2c_ok or gpio_ok or tof_ok or current_ok,
         "i2c_initialized": i2c_ok,
         "i2c_error": I2C_ERROR,
         "gpio_initialized": gpio_ok,
@@ -1192,6 +1351,7 @@ def reinitialize_hardware(
         "tof_initialized": tof_ok,
         "tof_error": TOF_ERROR,
         "tof_verification_enabled": TOF_VERIFICATION_ENABLED,
+        "current_monitor": get_current_monitor().capability().to_dict(),
     }
 
 
@@ -1261,7 +1421,7 @@ async def vend_mask(
 
     async with _vend_lock:
         try:
-            await _pulse_mask_repeated(
+            current_evidence = await _pulse_mask_repeated_with_current(
                 req.bank,
                 req.mask,
                 req.pulses,
@@ -1283,15 +1443,20 @@ async def vend_mask(
         finally:
             clear_vend_outputs_safe()
 
-    return {
-        "ok": True,
-        "mode": "vend_mask",
-        "bank": req.bank.upper(),
-        "mask": hex(req.mask),
-        "pulses": req.pulses,
-        "pulse_seconds": req.pulse_seconds,
-        "gap_seconds": req.gap_seconds,
-    }
+    return merge_current_into_vend_result(
+        {
+            "ok": True,
+            "mode": "vend_mask",
+            "bank": req.bank.upper(),
+            "mask": hex(req.mask),
+            "pulses": req.pulses,
+            "pulse_seconds": req.pulse_seconds,
+            "gap_seconds": req.gap_seconds,
+            "motor_activated": True,
+        },
+        current_evidence.to_dict(),
+        drop_verification_enabled=False,
+    )
 
 
 @app.post("/vend")
@@ -1310,7 +1475,7 @@ async def vend(
 
     async with _vend_lock:
         try:
-            await _pulse_mask_repeated(
+            current_evidence = await _pulse_mask_repeated_with_current(
                 bank,
                 mask,
                 req.pulses,
@@ -1332,16 +1497,21 @@ async def vend(
         finally:
             clear_vend_outputs_safe()
 
-    return {
-        "ok": True,
-        "mode": "vend",
-        "slot_id": response_slot_id,
-        "bank": bank,
-        "mask": hex(mask),
-        "pulses": req.pulses,
-        "pulse_seconds": req.pulse_seconds,
-        "gap_seconds": req.gap_seconds,
-    }
+    return merge_current_into_vend_result(
+        {
+            "ok": True,
+            "mode": "vend",
+            "slot_id": response_slot_id,
+            "bank": bank,
+            "mask": hex(mask),
+            "pulses": req.pulses,
+            "pulse_seconds": req.pulse_seconds,
+            "gap_seconds": req.gap_seconds,
+            "motor_activated": True,
+        },
+        current_evidence.to_dict(),
+        drop_verification_enabled=False,
+    )
 
 
 @app.post("/vend_mask_verified")
@@ -1389,7 +1559,7 @@ async def vend_mask_verified(
             ensure_i2c_ready()
             set_light_state_safe(STATE_PAYMENT_AUTHORIZED)
 
-            await _pulse_mask_once(
+            current_evidence = await _pulse_mask_once_with_current(
                 req.bank,
                 req.mask,
                 req.pulse_seconds,
@@ -1421,34 +1591,38 @@ async def vend_mask_verified(
         finally:
             clear_vend_outputs_safe()
 
-    return {
-        "ok": True,
-        "mode": "vend_mask_verified",
-        "bank": req.bank.upper(),
-        "mask": hex(req.mask),
-        "beam_check_enabled": False,
-        "beam_check_skipped": True,
-        "beam_broken": None,
-        "verified": False,
-        "motor_activated": True,
-        "tof_detection": False,
-        "verification_type": "none",
-        "vend_completed": True,
-        "attempt_count": 1,
-        "max_attempts": 1,
-        "message": (
-            "Vend pulse completed. ToF verification is disabled."
-        ),
-        "attempts": [
-            {
-                "attempt": 1,
-                "beam_check_skipped": True,
-                "pulse_completed": True,
-            }
-        ],
-        "pulse_seconds": req.pulse_seconds,
-        "beam_wait_seconds": 0,
-    }
+    return merge_current_into_vend_result(
+        {
+            "ok": True,
+            "mode": "vend_mask_verified",
+            "bank": req.bank.upper(),
+            "mask": hex(req.mask),
+            "beam_check_enabled": False,
+            "beam_check_skipped": True,
+            "beam_broken": None,
+            "verified": False,
+            "motor_activated": True,
+            "tof_detection": False,
+            "verification_type": "none",
+            "vend_completed": True,
+            "attempt_count": 1,
+            "max_attempts": 1,
+            "message": (
+                "Vend pulse completed. ToF verification is disabled."
+            ),
+            "attempts": [
+                {
+                    "attempt": 1,
+                    "beam_check_skipped": True,
+                    "pulse_completed": True,
+                }
+            ],
+            "pulse_seconds": req.pulse_seconds,
+            "beam_wait_seconds": 0,
+        },
+        current_evidence.to_dict(),
+        drop_verification_enabled=False,
+    )
 
 
 @app.post("/vend_mask_verified_test")
@@ -1844,7 +2018,7 @@ def commissioning_start(
 
 
 @app.post("/commissioning/discover")
-def commissioning_discover(
+async def commissioning_discover(
     x_api_key: Optional[str] = Header(default=None),
     x_sellmate_role: Optional[str] = Header(default=None, alias="X-SellMate-Role"),
     role: Optional[str] = None,
@@ -1856,8 +2030,12 @@ def commissioning_discover(
     )
     try:
         service = get_commissioning_service()
-        snapshot = service.discover()
-        suggested = service.suggested_layout_from_discovery()
+
+        def _run() -> Any:
+            return service.discover(), service.suggested_layout_from_discovery()
+
+        async with _vend_lock:
+            snapshot, suggested = await asyncio.to_thread(_run)
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
@@ -2022,16 +2200,22 @@ async def commissioning_validate_position(
                 # Fall back to a short pulse when ToF is unavailable; beam
                 # verification remains available via the test endpoint.
                 ensure_i2c_ready()
-                await _pulse_mask_once(req.bank, req.mask, req.pulse_seconds)
-                result = {
-                    "ok": True,
-                    "verified": False,
-                    "motor_activated": True,
-                    "verification_type": "none",
-                    "message": (
-                        "Motor pulsed; ToF unavailable for drop validation."
-                    ),
-                }
+                current_evidence = await _pulse_mask_once_with_current(
+                    req.bank, req.mask, req.pulse_seconds
+                )
+                result = merge_current_into_vend_result(
+                    {
+                        "ok": True,
+                        "verified": False,
+                        "motor_activated": True,
+                        "verification_type": "none",
+                        "message": (
+                            "Motor pulsed; ToF unavailable for drop validation."
+                        ),
+                    },
+                    current_evidence.to_dict(),
+                    drop_verification_enabled=False,
+                )
         except HTTPException:
             raise
         except Exception as e:
@@ -2045,7 +2229,16 @@ async def commissioning_validate_position(
         mask=req.mask,
         verified=bool(result.get("verified")),
         verification_type=result.get("verification_type"),
-        details={"position_id": req.position_id, "role": resolved},
+        details={"position_id": req.position_id, "role": resolved, **{
+            k: result.get(k)
+            for k in (
+                "motor_current_detected",
+                "motor_electrically_active",
+                "evidence_classification",
+                "motor_runtime_ms",
+            )
+            if k in result
+        }},
     )
     proposed_payload = None
     if proposed is not None:

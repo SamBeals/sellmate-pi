@@ -380,6 +380,14 @@ def complete_vend_job(
         "beam_verified": beam_verified,
         "result": result or {},
     }
+    items = (result or {}).get("items") or []
+    last = items[-1] if items else (result or {})
+    if "motor_current_detected" in last:
+        payload["motor_current_detected"] = last.get("motor_current_detected")
+    if "tof_detection" in last:
+        payload["tof_detection"] = last.get("tof_detection")
+    if "evidence_classification" in last:
+        payload["evidence_classification"] = last.get("evidence_classification")
 
     if error:
         payload["error"] = error
@@ -445,6 +453,17 @@ def execute_vend_job(
                     "ok": bool(vend_result.get("ok")),
                     "verified": verified,
                     "motor_activated": vend_result.get("motor_activated"),
+                    "motor_commanded": vend_result.get("motor_commanded"),
+                    "motor_current_detected": vend_result.get(
+                        "motor_current_detected"
+                    ),
+                    "motor_electrically_active": vend_result.get(
+                        "motor_electrically_active"
+                    ),
+                    "motor_runtime_ms": vend_result.get("motor_runtime_ms"),
+                    "evidence_classification": vend_result.get(
+                        "evidence_classification"
+                    ),
                     "tof_detection": vend_result.get("tof_detection"),
                     "verification_type": vend_result.get(
                         "verification_type"
@@ -465,6 +484,8 @@ def execute_vend_job(
                 f"unit={unit_num}/{qty} "
                 f"ok={vend_result.get('ok')} "
                 f"verified={verified} "
+                f"motor_current_detected={vend_result.get('motor_current_detected')} "
+                f"evidence={vend_result.get('evidence_classification')} "
                 f"failure_reason={vend_result.get('failure_reason')}"
             )
 
