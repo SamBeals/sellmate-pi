@@ -26,6 +26,7 @@ import traceback
 from typing import Optional, List, Dict, Any, Tuple
 
 from fastapi import FastAPI, HTTPException, Header
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, model_validator
 
 from commissioning import get_commissioning_service
@@ -53,6 +54,30 @@ from vend_evidence import merge_current_into_vend_result
 app = FastAPI(
     title="SellMate Vend API",
     version="1.4.0",
+)
+
+# Browser dashboard (npm run dev on the technician Mac) calls these routes
+# directly on Local Wi-Fi. Custom X-API-Key / X-SellMate-Role headers trigger
+# a CORS preflight; without this middleware Safari blocks the Pi responses.
+_cors_origins = [
+    origin.strip()
+    for origin in os.getenv(
+        "COMMISSIONING_CORS_ORIGINS",
+        "http://localhost:3000,http://127.0.0.1:3000",
+    ).split(",")
+    if origin.strip()
+]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_cors_origins,
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=[
+        "Accept",
+        "Content-Type",
+        "X-API-Key",
+        "X-SellMate-Role",
+    ],
 )
 
 
