@@ -93,6 +93,14 @@ def pi_headers() -> Dict[str, str]:
     return headers
 
 
+def vend_auth_headers() -> Dict[str, str]:
+    """Machine credential for claim and complete. The secret is not logged."""
+    token = os.getenv("MACHINE_API_TOKEN") or os.getenv("MACHINE_SHARED_TOKEN") or ""
+    if not token:
+        raise RuntimeError("MACHINE_API_TOKEN is not configured")
+    return {"X-Machine-Token": token}
+
+
 def next_error_backoff_seconds(current_seconds: float) -> float:
     """Exponential backoff: base → … → max (inclusive)."""
     return min(current_seconds * 2, ERROR_BACKOFF_MAX_SECONDS)
@@ -116,6 +124,7 @@ def claim_vend_job() -> Optional[Dict[str, Any]]:
     resp = SESSION.get(
         url,
         params=params,
+        headers=vend_auth_headers(),
         timeout=timeout,
     )
 
@@ -405,6 +414,7 @@ def complete_vend_job(
     resp = SESSION.post(
         url,
         json=payload,
+        headers=vend_auth_headers(),
         timeout=(5, 60),
     )
 
@@ -1015,6 +1025,8 @@ def main() -> None:
         f"error_backoff_max={ERROR_BACKOFF_MAX_SECONDS}s "
         f"using X-API-Key="
         f"{'(set)' if PI_API_KEY else '(empty)'} "
+        f"machine_api_token="
+        f"{'(set)' if (os.getenv('MACHINE_API_TOKEN') or os.getenv('MACHINE_SHARED_TOKEN')) else '(empty)'} "
         f"tof_verification_enabled={TOF_VERIFICATION_ENABLED} "
         f"commissioning_commands={COMMISSIONING_COMMANDS_ENABLED} "
         f"topology_sync_interval={TOPOLOGY_SYNC_INTERVAL_SECONDS}s"

@@ -77,6 +77,7 @@ def setUpModule():
     os.environ["SELLMATE_VEND_JOURNAL_PATH"] = str(
         Path(_JOURNAL_DIR.name) / "vend_report.json"
     )
+    os.environ["MACHINE_API_TOKEN"] = "unit-test-token"
 
 
 def tearDownModule():
@@ -103,6 +104,8 @@ class TestClaimShortPoll(unittest.TestCase):
             kwargs["timeout"],
             (5, poller.REQUEST_TIMEOUT_SECONDS),
         )
+        self.assertEqual(kwargs["headers"]["X-Machine-Token"], "unit-test-token")
+        self.assertNotIn("unit-test-token", str(kwargs["params"]))
         self.assertLessEqual(kwargs["timeout"][1], 15)
 
     @patch.object(poller, "SESSION")
