@@ -1551,8 +1551,9 @@ async def vend_mask_verified(
       per-vend ToF baseline → motor pulse → sudden distance decrease required.
 
     When disabled:
-      motor is pulsed once; request succeeds when the pulse completes
-      (legacy behavior; no drop verification).
+      motor is pulsed once and the HTTP body is ok=true, verified=false.
+      That is motor-only pulse completion, not a paid dispense. Paid-order
+      evidence requires a confirmed drop (verified=true).
     """
     _require_api_key(x_api_key)
 

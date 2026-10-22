@@ -324,8 +324,8 @@ def call_verified_vend(bank: str, mask: int) -> Dict[str, Any]:
     """
     Calls the production vend endpoint.
 
-    When ToF verification is enabled on the Pi, success requires a verified
-    drop detection. When disabled, {"ok": true} after the motor pulse is enough.
+    A paid dispense still requires verified=true. A motor-only ok=true with
+    verified=false stays unknown even when ToF verification is disabled.
     """
 
     url = f"{PI_BASE}/vend_mask_verified"
@@ -413,13 +413,24 @@ def complete_vend_job(
     return resp.json()
 
 
+def bench_motor_only_completed(vend_result: Dict[str, Any]) -> bool:
+    """
+    Motor-bench pulse completion. The /vend bench endpoint uses this shape.
+
+    Paid orders do not call this. ok=True with verified=False is not a drop.
+    """
+    return bool(vend_result.get("ok")) and vend_result.get("motor_activated") is not False
+
+
 def unit_succeeded(vend_result: Dict[str, Any]) -> bool:
-    ok = bool(vend_result.get("ok"))
+    """
+    Confirmed drop for a paid order.
 
-    if not TOF_VERIFICATION_ENABLED:
-        return ok
-
-    return ok and bool(vend_result.get("verified"))
+    verified=False is never a dispense, including when ToF is disabled.
+    """
+    if vend_result.get("verified") is not True:
+        return False
+    return bool(vend_result.get("ok"))
 
 
 _UNIT_EVIDENCE_KEYS = (
@@ -570,6 +581,8 @@ def _apply_vend_result(unit: Dict[str, Any], vend_result: Dict[str, Any]) -> Non
 
     not_dispensed is only for evidence that the motor never started,
     such as a pre-motor sensor rejection (motor_activated is False).
+    Motor-only ok=True with verified=False is unknown for paid orders,
+    including when ToF verification is disabled.
     """
     for key in _UNIT_EVIDENCE_KEYS:
         if key in vend_result:

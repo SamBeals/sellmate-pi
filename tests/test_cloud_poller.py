@@ -954,6 +954,45 @@ class TestVendReportSurvivesCloudError(unittest.TestCase):
         vend.assert_not_called()
         self.assertIsNone(poller.load_vend_report())
 
+    def test_motor_only_ok_is_not_paid_dispense_when_tof_disabled(self):
+        motor_only = {
+            "ok": True,
+            "verified": False,
+            "motor_activated": True,
+            "verification_type": "none",
+            "message": "Vend pulse completed. ToF verification is disabled.",
+        }
+        posted = {}
+
+        def _keep(**kwargs):
+            posted.update(kwargs)
+            return {
+                "status": "FAILED",
+                "payment_status": "unresolved",
+                "payment_recovery": "pi",
+                "inventory_status": "pending",
+            }
+
+        with patch.object(poller, "TOF_VERIFICATION_ENABLED", False):
+            self.assertFalse(poller.unit_succeeded(motor_only))
+            self.assertTrue(poller.bench_motor_only_completed(motor_only))
+            with patch.object(
+                poller, "call_verified_vend", return_value=motor_only
+            ) as vend, patch.object(
+                poller, "complete_vend_job", side_effect=_keep
+            ):
+                poller.handle_vend_job(self._job())
+                vend.reset_mock()
+                poller.handle_vend_job(self._job())
+            vend.assert_not_called()
+
+        item = posted["result"]["items"][0]
+        self.assertEqual(item["outcome"], "unknown")
+        self.assertNotIn("ok", item)
+        self.assertNotEqual(posted["status"], "SUCCESS")
+        self.assertTrue(item["motor_activated"])
+        self.assertFalse(item["verified"])
+
 
 if __name__ == "__main__":
     unittest.main()
