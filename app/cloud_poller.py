@@ -6,6 +6,11 @@ from typing import Any, Dict, List, Optional, Tuple
 from config import MACHINE_ID
 from topology_mapping import LEGACY_SLOT_TO_HW, resolve_hw
 from topology_store import get_topology_store
+from vend_report_journal import (
+    clear_vend_report,
+    load_vend_report,
+    save_vend_report,
+)
 
 CLOUD_BASE = os.getenv(
     "CLOUD_BASE",
@@ -310,6 +315,11 @@ def normalize_items(job: Dict[str, Any]) -> List[Dict[str, Any]]:
     return normalized
 
 
+# Prefix of the ValueError raised when the motor API responds with a body
+# we cannot parse. The motor may already have moved.
+_UNEXPECTED_VEND_RESPONSE_PREFIX = "Pi vend API returned unexpected response"
+
+
 def call_verified_vend(bank: str, mask: int) -> Dict[str, Any]:
     """
     Calls the production vend endpoint.
@@ -360,7 +370,7 @@ def call_verified_vend(bank: str, mask: int) -> Dict[str, Any]:
 
     if not isinstance(data, dict):
         raise ValueError(
-            f"Pi vend API returned unexpected response: {data}"
+            f"{_UNEXPECTED_VEND_RESPONSE_PREFIX}: {data}"
         )
 
     return data
@@ -412,121 +422,493 @@ def unit_succeeded(vend_result: Dict[str, Any]) -> bool:
     return ok and bool(vend_result.get("verified"))
 
 
+_UNIT_EVIDENCE_KEYS = (
+    "motor_activated",
+    "motor_commanded",
+    "motor_current_detected",
+    "motor_electrically_active",
+    "motor_runtime_ms",
+    "evidence_classification",
+    "tof_detection",
+    "verification_type",
+    "baseline_cm",
+    "min_distance_cm",
+    "drop_cm",
+    "failure_reason",
+    "message",
+    "attempt_count",
+    "attempts",
+)
+
+
+def _plan_units(vend_job_id: str, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """One stable id per physical unit, including repeats of the same slot."""
+    units: List[Dict[str, Any]] = []
+    seq = 0
+    for item in items:
+        qty = int(item["qty"])
+        for unit_num in range(1, qty + 1):
+            seq += 1
+            units.append(
+                {
+                    "unit_id": f"{vend_job_id}:{seq}",
+                    "seq": seq,
+                    "slot_id": item["slot_id"],
+                    "unit": unit_num,
+                    "qty": qty,
+                    "bank": item["bank"],
+                    "mask": item["mask"],
+                    "outcome": "not_attempted",
+                }
+            )
+    return units
+
+
+def _unit_stops_basket(unit: Dict[str, Any]) -> bool:
+    return unit.get("outcome") in {"unknown", "not_dispensed", "in_progress"}
+
+
+def _result_from_units(entry: Dict[str, Any]) -> Dict[str, Any]:
+    items = []
+    failed_slot_id = None
+    for unit in entry.get("units") or []:
+        row = {
+            "unit_id": unit.get("unit_id"),
+            "seq": unit.get("seq"),
+            "slot_id": unit.get("slot_id"),
+            "unit": unit.get("unit"),
+            "qty": unit.get("qty"),
+            "outcome": unit.get("outcome"),
+        }
+        if "ok" in unit:
+            row["ok"] = unit.get("ok")
+        if "verified" in unit:
+            row["verified"] = unit.get("verified")
+        for key in _UNIT_EVIDENCE_KEYS:
+            if key in unit:
+                row[key] = unit.get(key)
+        items.append(row)
+        if failed_slot_id is None and unit.get("outcome") in {
+            "not_dispensed",
+            "unknown",
+        }:
+            failed_slot_id = unit.get("slot_id")
+    result: Dict[str, Any] = {
+        "vend_job_id": entry.get("vend_job_id"),
+        "order_id": entry.get("order_id"),
+        "items": items,
+        "beam_verification_required": False,
+        "tof_verification_required": TOF_VERIFICATION_ENABLED,
+        "verification_type": "tof" if TOF_VERIFICATION_ENABLED else "none",
+    }
+    if failed_slot_id:
+        result["failed_slot_id"] = failed_slot_id
+    return result
+
+
+def _all_units_dispensed(units: List[Dict[str, Any]]) -> bool:
+    return bool(units) and all(unit.get("outcome") == "dispensed" for unit in units)
+
+
+def _persist_units(entry: Dict[str, Any]) -> None:
+    entry["result"] = _result_from_units(entry)
+    save_vend_report(entry)
+
+
+def _reconcile_interrupted(entry: Dict[str, Any]) -> Dict[str, Any]:
+    """An in-progress motor request did not return. It is unknown, not a retry."""
+    changed = False
+    for unit in entry.get("units") or []:
+        if unit.get("outcome") == "in_progress":
+            unit["outcome"] = "unknown"
+            unit.pop("ok", None)
+            changed = True
+    if changed:
+        _persist_units(entry)
+        log(
+            f"vend_job={entry.get('vend_job_id')} "
+            f"interrupted motor request marked unknown; not pulsing it again"
+        )
+    return entry
+
+
+def _finalize_unit_report(entry: Dict[str, Any]) -> None:
+    units = entry.get("units") or []
+    if _all_units_dispensed(units):
+        entry["report_status"] = "SUCCESS"
+        entry["error"] = None
+        entry["beam_verified"] = bool(TOF_VERIFICATION_ENABLED)
+    else:
+        entry["report_status"] = "FAILED"
+        unknown = any(unit.get("outcome") == "unknown" for unit in units)
+        dispensed = any(unit.get("outcome") == "dispensed" for unit in units)
+        if unknown:
+            entry["error"] = "Physical outcome unknown"
+        elif dispensed:
+            entry["error"] = "Partial dispense"
+        else:
+            failed = next(
+                (
+                    unit
+                    for unit in units
+                    if unit.get("outcome") == "not_dispensed"
+                ),
+                None,
+            )
+            entry["error"] = (
+                (failed or {}).get("message")
+                or (failed or {}).get("failure_reason")
+                or "Vend failed"
+            )
+        entry["beam_verified"] = False
+    _persist_units(entry)
+
+
+def _apply_vend_result(unit: Dict[str, Any], vend_result: Dict[str, Any]) -> None:
+    vend_ok = unit_succeeded(vend_result)
+    unit["outcome"] = "dispensed" if vend_ok else "not_dispensed"
+    unit["ok"] = bool(vend_ok)
+    unit["verified"] = bool(vend_result.get("verified", False))
+    for key in _UNIT_EVIDENCE_KEYS:
+        if key in vend_result:
+            unit[key] = vend_result.get(key)
+
+
+def _mark_unit_unknown(unit: Dict[str, Any]) -> None:
+    unit["outcome"] = "unknown"
+    unit.pop("ok", None)
+
+
+def _run_pending_units(entry: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Pulse only units still marked not_attempted.
+
+    Stops the rest of the basket after a confirmed failure or an unknown
+    outcome. Does not repeat a unit that was already in progress.
+    """
+    entry = _reconcile_interrupted(entry)
+    if entry.get("report_status"):
+        return entry
+    units = entry.get("units") or []
+    for unit in units:
+        if any(_unit_stops_basket(earlier) for earlier in units):
+            break
+        if unit.get("outcome") != "not_attempted":
+            continue
+        unit["outcome"] = "in_progress"
+        _persist_units(entry)
+        try:
+            vend_result = call_verified_vend(
+                bank=unit["bank"],
+                mask=unit["mask"],
+            )
+        except requests.RequestException as exc:
+            _mark_unit_unknown(unit)
+            unit["message"] = str(exc)
+            _persist_units(entry)
+            log(
+                f"vend_job={entry.get('vend_job_id')} "
+                f"unit_id={unit.get('unit_id')} motor request failed; "
+                f"outcome=unknown; not repeating"
+            )
+            break
+        except ValueError as exc:
+            if _UNEXPECTED_VEND_RESPONSE_PREFIX in str(exc):
+                _mark_unit_unknown(unit)
+                unit["message"] = str(exc)
+                _persist_units(entry)
+                break
+            raise
+        _apply_vend_result(unit, vend_result)
+        _persist_units(entry)
+        log(
+            f"vend_job={entry.get('vend_job_id')} "
+            f"unit_id={unit.get('unit_id')} "
+            f"slot={unit.get('slot_id')} "
+            f"outcome={unit.get('outcome')}"
+        )
+        if unit.get("outcome") != "dispensed":
+            break
+    _finalize_unit_report(entry)
+    return entry
+
+
 def execute_vend_job(
     job: Dict[str, Any],
 ) -> Tuple[bool, Dict[str, Any], Optional[str]]:
-    vend_job_id = job.get("vend_job_id") or job.get("id") or "unknown"
+    vend_job_id = str(job.get("vend_job_id") or job.get("id") or "unknown")
     order_id = job.get("order_id") or "unknown"
     items = normalize_items(job)
-
-    attempts_summary: List[Dict[str, Any]] = []
-
+    units = _plan_units(vend_job_id, items)
+    entry: Dict[str, Any] = {
+        "vend_job_id": vend_job_id,
+        "order_id": order_id,
+        "units": units,
+    }
+    # Plan is durable before any motor request.
+    _persist_units(entry)
     log(
         f"claimed vend_job={vend_job_id} "
         f"order={order_id} "
-        f"item_count={len(items)} "
+        f"unit_count={len(units)} "
         f"tof_verification_enabled={TOF_VERIFICATION_ENABLED}"
     )
+    entry = _run_pending_units(entry)
+    result = entry.get("result") or _result_from_units(entry)
+    success = entry.get("report_status") == "SUCCESS"
+    error = None if success else entry.get("error")
+    return success, result, error
 
-    for item in items:
-        slot_id = item["slot_id"]
-        bank = item["bank"]
-        mask = item["mask"]
-        qty = item["qty"]
 
-        for unit_num in range(1, qty + 1):
-            # Multi-qty: each unit gets a fresh per-vend ToF baseline inside
-            # the local API (collect → pulse → detect).
-            vend_result = call_verified_vend(
-                bank=bank,
-                mask=mask,
-            )
+def _journal_entry(
+    vend_job_id: str,
+    order_id: Optional[str],
+    report_status: str,
+    result: Dict[str, Any],
+    error: Optional[str],
+) -> Dict[str, Any]:
+    # ToF success already required verified=true inside execute_vend_job.
+    beam_verified = report_status == "SUCCESS" and TOF_VERIFICATION_ENABLED
+    return {
+        "vend_job_id": vend_job_id,
+        "order_id": order_id,
+        "report_status": report_status,
+        "beam_verified": beam_verified,
+        "result": result,
+        "error": error,
+    }
 
-            vend_ok = unit_succeeded(vend_result)
-            verified = bool(vend_result.get("verified", False))
 
-            attempts_summary.append(
-                {
-                    "slot_id": slot_id,
-                    "unit": unit_num,
-                    "qty": qty,
-                    "ok": bool(vend_result.get("ok")),
-                    "verified": verified,
-                    "motor_activated": vend_result.get("motor_activated"),
-                    "motor_commanded": vend_result.get("motor_commanded"),
-                    "motor_current_detected": vend_result.get(
-                        "motor_current_detected"
-                    ),
-                    "motor_electrically_active": vend_result.get(
-                        "motor_electrically_active"
-                    ),
-                    "motor_runtime_ms": vend_result.get("motor_runtime_ms"),
-                    "evidence_classification": vend_result.get(
-                        "evidence_classification"
-                    ),
-                    "tof_detection": vend_result.get("tof_detection"),
-                    "verification_type": vend_result.get(
-                        "verification_type"
-                    ),
-                    "baseline_cm": vend_result.get("baseline_cm"),
-                    "min_distance_cm": vend_result.get("min_distance_cm"),
-                    "drop_cm": vend_result.get("drop_cm"),
-                    "failure_reason": vend_result.get("failure_reason"),
-                    "message": vend_result.get("message"),
-                    "attempt_count": vend_result.get("attempt_count"),
-                    "attempts": vend_result.get("attempts"),
-                }
-            )
+def _payment_settled(response: Dict[str, Any]) -> bool:
+    payment = str(response.get("payment_status") or "").lower()
+    if payment == "unresolved":
+        return False
+    if payment == "captured":
+        return True
+    action = str(response.get("payment_action") or "").upper()
+    return action == "CAPTURED"
 
-            log(
-                f"vend_job={vend_job_id} "
-                f"slot={slot_id} "
-                f"unit={unit_num}/{qty} "
-                f"ok={vend_result.get('ok')} "
-                f"verified={verified} "
-                f"motor_current_detected={vend_result.get('motor_current_detected')} "
-                f"evidence={vend_result.get('evidence_classification')} "
-                f"failure_reason={vend_result.get('failure_reason')}"
-            )
 
-            if not vend_ok:
-                error = (
-                    vend_result.get("message")
-                    or vend_result.get("failure_reason")
-                    or f"Vend failed for {slot_id}"
-                )
+def _confirmed_cancellation(response: Dict[str, Any]) -> bool:
+    payment = str(response.get("payment_status") or "").lower()
+    action = str(response.get("payment_action") or "").upper()
+    if payment in {"cancelled", "canceled"}:
+        return True
+    return action in {"CANCELLED", "CANCELED"}
 
-                return (
-                    False,
-                    {
-                        "vend_job_id": vend_job_id,
-                        "order_id": order_id,
-                        "items": attempts_summary,
-                        "failed_slot_id": slot_id,
-                        "raw_result": vend_result,
-                        "beam_verification_required": False,
-                        "tof_verification_required": TOF_VERIFICATION_ENABLED,
-                        "verification_type": (
-                            "tof" if TOF_VERIFICATION_ENABLED else "none"
-                        ),
-                    },
-                    error,
-                )
 
-    return (
-        True,
-        {
-            "vend_job_id": vend_job_id,
-            "order_id": order_id,
-            "items": attempts_summary,
-            "beam_verification_required": False,
-            "tof_verification_required": TOF_VERIFICATION_ENABLED,
-            "verification_type": (
-                "tof" if TOF_VERIFICATION_ENABLED else "none"
-            ),
-        },
-        None,
+def _item_outcome(item: Any) -> str:
+    if not isinstance(item, dict):
+        return "unknown"
+    outcome = str(item.get("outcome") or "").lower()
+    if outcome == "in_progress":
+        return "unknown"
+    if outcome in {"dispensed", "not_dispensed", "not_attempted", "unknown"}:
+        return outcome
+    if item.get("ok") is True:
+        return "dispensed"
+    if item.get("ok") is False:
+        return "not_dispensed"
+    return "unknown"
+
+
+def _blocks_confirmed_cancellation(result: Any) -> bool:
+    """Dispensed or unknown units must not be cleared by a cancel response."""
+    if not isinstance(result, dict) or not isinstance(result.get("items"), list):
+        return True
+    for item in result["items"]:
+        if _item_outcome(item) in {"dispensed", "unknown"}:
+            return True
+    return False
+
+
+def _operator_review_stored(response: Dict[str, Any]) -> bool:
+    if str(response.get("payment_recovery") or "").lower() != "awaiting_operator":
+        return False
+    review = response.get("operator_review")
+    if not isinstance(review, dict):
+        return False
+    if not review.get("vend_job_id"):
+        return False
+    if "physical_result" not in review:
+        return False
+    if not review.get("reason"):
+        return False
+    return "last_error" in review
+
+
+def _inventory_closed(response: Dict[str, Any]) -> bool:
+    """Older replies omit inventory_status. A pending count keeps the journal."""
+    status = str(response.get("inventory_status") or "").lower()
+    if not status:
+        return True
+    return status in {"recorded", "reconciliation"}
+
+
+def _report_accepted(entry: Dict[str, Any], response: Dict[str, Any]) -> bool:
+    """
+    True when this poller may delete its journal.
+
+    A dispense stays on disk until payment is captured, or the cloud has
+    stored an operator-review record. A failed vend is cleared only after
+    confirmed cancellation and only when every unit outcome is known.
+    HTTP success alone is not enough. A reporting error is not a cancel.
+    """
+    if not isinstance(response, dict):
+        return False
+    if not _inventory_closed(response):
+        return False
+    remote = str(response.get("status") or "").upper()
+    stored = str(entry.get("report_status") or "").upper()
+    recovery = str(response.get("payment_recovery") or "").lower()
+    if stored == "SUCCESS":
+        if _operator_review_stored(response):
+            return True
+        if _payment_settled(response):
+            return True
+        # Older success replies omit payment fields. Status SUCCESS then
+        # means capture finished. An explicit unresolved payment does not.
+        if (
+            remote == "SUCCESS"
+            and not response.get("payment_status")
+            and not recovery
+        ):
+            return True
+        return False
+    if stored == "FAILED":
+        if _payment_settled(response):
+            return True
+        if _operator_review_stored(response):
+            return True
+        if remote in {"FAILED", "CANCELLED"} and _confirmed_cancellation(response):
+            if _blocks_confirmed_cancellation(entry.get("result")):
+                return False
+            return True
+    return False
+
+
+def _remember_unresolved_attempt(
+    entry: Dict[str, Any],
+    response: Dict[str, Any],
+) -> None:
+    """Persist the capture retry count and backoff. Does not pulse."""
+    if str(entry.get("report_status") or "").upper() not in {"SUCCESS", "FAILED"}:
+        return
+    payment = str(response.get("payment_status") or "").lower()
+    recovery = str(response.get("payment_recovery") or "").lower()
+    if payment != "unresolved" and recovery != "pi":
+        return
+    if response.get("capture_attempts") is not None:
+        attempts = int(response["capture_attempts"])
+    else:
+        attempts = int(entry.get("payment_attempts") or 0) + 1
+    backoff = ERROR_BACKOFF_BASE_SECONDS
+    for _ in range(max(0, attempts - 1)):
+        backoff = next_error_backoff_seconds(backoff)
+    updated = dict(entry)
+    updated["payment_attempts"] = attempts
+    updated["retry_backoff_seconds"] = backoff
+    last_error = response.get("last_error") or response.get("error")
+    if last_error:
+        updated["last_error"] = last_error
+    save_vend_report(updated)
+
+
+def flush_vend_report() -> bool:
+    """
+    Post the stored vend report. Does not call the motor.
+
+    Returns True when a report is still pending (keep the journal).
+    """
+    entry = load_vend_report()
+    if entry is None:
+        return False
+
+    report_status = str(entry.get("report_status") or "").upper()
+    if not report_status:
+        log(
+            f"vend_job={entry.get('vend_job_id')} has no finished report; "
+            f"not posting and not pulsing"
+        )
+        return True
+
+    response = complete_vend_job(
+        vend_job_id=str(entry["vend_job_id"]),
+        status=report_status,
+        beam_verified=bool(entry.get("beam_verified")),
+        result=entry.get("result") or {},
+        error=entry.get("error"),
     )
+    if _report_accepted(entry, response):
+        clear_vend_report()
+        log(
+            f"vend_job={entry.get('vend_job_id')} report {report_status} "
+            f"accepted; payment_action={response.get('payment_action')}"
+        )
+        return False
+
+    _remember_unresolved_attempt(entry, response)
+    log(
+        f"vend_job={entry.get('vend_job_id')} report {report_status} "
+        f"not accepted (status={response.get('status')}, "
+        f"payment_status={response.get('payment_status')}); "
+        f"keeping journal and not pulsing"
+    )
+    return True
+
+
+def _remember_and_flush(
+    vend_job_id: str,
+    order_id: Optional[str],
+    report_status: str,
+    result: Dict[str, Any],
+    error: Optional[str],
+) -> None:
+    save_vend_report(
+        _journal_entry(
+            vend_job_id=vend_job_id,
+            order_id=order_id,
+            report_status=report_status,
+            result=result,
+            error=error,
+        )
+    )
+    try:
+        flush_vend_report()
+    except requests.RequestException as exc:
+        log(
+            f"vend_job={vend_job_id} report {report_status} failed; "
+            f"keeping stored outcome and not pulsing again; error={exc}"
+        )
+
+
+def _flush_saved_report() -> None:
+    try:
+        flush_vend_report()
+    except requests.RequestException as exc:
+        entry = load_vend_report() or {}
+        log(
+            f"vend_job={entry.get('vend_job_id')} report failed; "
+            f"keeping stored units and not pulsing again; error={exc}"
+        )
+
+
+def resume_pending_vend() -> bool:
+    """
+    Continue or report the on-disk unit plan. Does not repeat unknown work.
+
+    Returns True when the journal is still pending.
+    """
+    entry = load_vend_report()
+    if entry is None:
+        return False
+    if not entry.get("report_status"):
+        if entry.get("units"):
+            _run_pending_units(entry)
+        else:
+            return True
+    _flush_saved_report()
+    return load_vend_report() is not None
 
 
 def handle_vend_job(job: Dict[str, Any]) -> None:
@@ -537,74 +919,44 @@ def handle_vend_job(job: Dict[str, Any]) -> None:
             f"vend job missing vend_job_id: {job}"
         )
 
+    pending = load_vend_report()
+    if pending is not None:
+        log(
+            f"vend_job={pending.get('vend_job_id')} resuming saved units; "
+            f"not repeating finished or unknown units"
+        )
+        resume_pending_vend()
+        return
+
     try:
-        success, result, error = execute_vend_job(job)
-
-        if success:
-            # When ToF is enabled, success already required verified=true.
-            beam_verified = True if TOF_VERIFICATION_ENABLED else False
-
-            response = complete_vend_job(
-                vend_job_id=vend_job_id,
-                status="SUCCESS",
-                beam_verified=beam_verified,
-                result=result,
-            )
-
+        execute_vend_job(job)
+    except ValueError as exc:
+        if _UNEXPECTED_VEND_RESPONSE_PREFIX in str(exc):
+            pending_after = load_vend_report()
+            if pending_after is not None:
+                resume_pending_vend()
+                return
             log(
-                f"vend_job={vend_job_id} SUCCESS; "
-                f"beam_verified={beam_verified}; "
-                f"tof_verification_enabled={TOF_VERIFICATION_ENABLED}; "
-                f"payment_action={response.get('payment_action')}"
+                f"vend_job={vend_job_id} motor response was unusable; "
+                f"not reporting it as not dispensed; error={exc}"
             )
-
             return
-
-        response = complete_vend_job(
-            vend_job_id=vend_job_id,
-            status="FAILED",
-            beam_verified=False,
+        result = {
+            "vend_job_id": vend_job_id,
+            "order_id": job.get("order_id"),
+            "items": [],
+            "message": str(exc),
+        }
+        _remember_and_flush(
+            vend_job_id=str(vend_job_id),
+            order_id=job.get("order_id"),
+            report_status="FAILED",
             result=result,
-            error=error or "Vend failed",
+            error=str(exc),
         )
+        return
 
-        log(
-            f"vend_job={vend_job_id} FAILED; "
-            f"payment_action={response.get('payment_action')} "
-            f"error={error}"
-        )
-
-    except Exception as e:
-        try:
-            complete_vend_job(
-                vend_job_id=vend_job_id,
-                status="FAILED",
-                beam_verified=False,
-                result={
-                    "exception_type": type(e).__name__,
-                    "beam_verification_required": False,
-                    "tof_verification_required": TOF_VERIFICATION_ENABLED,
-                    "verification_type": (
-                        "tof" if TOF_VERIFICATION_ENABLED else "none"
-                    ),
-                },
-                error=str(e),
-            )
-
-        except Exception as report_error:
-            log(
-                f"vend_job={vend_job_id} local failure AND "
-                f"cloud report failed; "
-                f"local_error={e}; "
-                f"report_error={report_error}"
-            )
-
-            return
-
-        log(
-            f"vend_job={vend_job_id} FAILED; "
-            f"error={e}"
-        )
+    _flush_saved_report()
 
 
 def main() -> None:
@@ -629,6 +981,18 @@ def main() -> None:
 
     while True:
         try:
+            # Replay a finished vend before claiming or moving hardware again.
+            if load_vend_report() is not None:
+                if resume_pending_vend():
+                    pending = load_vend_report() or {}
+                    time.sleep(
+                        float(
+                            pending.get("retry_backoff_seconds")
+                            or POLL_INTERVAL_SECONDS
+                        )
+                    )
+                    continue
+
             # Hybrid FEATURE-013: keep local active topology aligned with cloud
             # approvals, and execute remote commissioning commands when present.
             sync_active_topology_from_cloud()
