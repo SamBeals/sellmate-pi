@@ -565,13 +565,26 @@ def _finalize_unit_report(entry: Dict[str, Any]) -> None:
 
 
 def _apply_vend_result(unit: Dict[str, Any], vend_result: Dict[str, Any]) -> None:
-    vend_ok = unit_succeeded(vend_result)
-    unit["outcome"] = "dispensed" if vend_ok else "not_dispensed"
-    unit["ok"] = bool(vend_ok)
-    unit["verified"] = bool(vend_result.get("verified", False))
+    """
+    A pulse without confirmed drop detection is unknown.
+
+    not_dispensed is only for evidence that the motor never started,
+    such as a pre-motor sensor rejection (motor_activated is False).
+    """
     for key in _UNIT_EVIDENCE_KEYS:
         if key in vend_result:
             unit[key] = vend_result.get(key)
+    unit["verified"] = bool(vend_result.get("verified", False))
+    if unit_succeeded(vend_result):
+        unit["outcome"] = "dispensed"
+        unit["ok"] = True
+        return
+    if vend_result.get("motor_activated") is False:
+        unit["outcome"] = "not_dispensed"
+        unit["ok"] = False
+        return
+    unit["outcome"] = "unknown"
+    unit.pop("ok", None)
 
 
 def _mark_unit_unknown(unit: Dict[str, Any]) -> None:
@@ -737,9 +750,26 @@ def _operator_review_stored(response: Dict[str, Any]) -> bool:
     return "last_error" in review
 
 
-def _inventory_closed(response: Dict[str, Any]) -> bool:
-    """Older replies omit inventory_status. A pending count keeps the journal."""
+def _journal_uses_unit_accounting(entry: Dict[str, Any]) -> bool:
+    units = entry.get("units")
+    if not isinstance(units, list):
+        result = entry.get("result")
+        units = result.get("items") if isinstance(result, dict) else None
+    if not isinstance(units, list):
+        return False
+    return any(isinstance(unit, dict) and unit.get("unit_id") for unit in units)
+
+
+def _inventory_closed(response: Dict[str, Any], entry: Dict[str, Any]) -> bool:
+    """
+    Per-unit journals stay until the cloud names a finished inventory state.
+
+    Legacy whole-job reports omit inventory_status; that omission is complete
+    only for those older replies.
+    """
     status = str(response.get("inventory_status") or "").lower()
+    if _journal_uses_unit_accounting(entry):
+        return status in {"recorded", "reconciliation"}
     if not status:
         return True
     return status in {"recorded", "reconciliation"}
@@ -756,7 +786,7 @@ def _report_accepted(entry: Dict[str, Any], response: Dict[str, Any]) -> bool:
     """
     if not isinstance(response, dict):
         return False
-    if not _inventory_closed(response):
+    if not _inventory_closed(response, entry):
         return False
     remote = str(response.get("status") or "").upper()
     stored = str(entry.get("report_status") or "").upper()

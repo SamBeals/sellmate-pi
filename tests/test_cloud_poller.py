@@ -305,6 +305,7 @@ class TestVendReportSurvivesCloudError(unittest.TestCase):
             return_value={
                 "status": "SUCCESS",
                 "payment_action": "CAPTURED",
+                "inventory_status": "recorded",
             },
         ) as complete:
             self.assertFalse(poller.flush_vend_report())
@@ -324,8 +325,9 @@ class TestVendReportSurvivesCloudError(unittest.TestCase):
             "call_verified_vend",
             return_value={
                 "ok": False,
-                "failure_reason": "no_drop",
-                "message": "no drop",
+                "motor_activated": False,
+                "failure_reason": "sensor_unavailable",
+                "message": "No motor pulse was started.",
             },
         ) as vend, patch.object(
             poller,
@@ -333,6 +335,7 @@ class TestVendReportSurvivesCloudError(unittest.TestCase):
             return_value={
                 "status": "FAILED",
                 "payment_action": "CANCELLED",
+                "inventory_status": "recorded",
             },
         ) as complete:
             poller.handle_vend_job(self._job())
@@ -351,7 +354,12 @@ class TestVendReportSurvivesCloudError(unittest.TestCase):
         with patch.object(
             poller,
             "call_verified_vend",
-            return_value={"ok": False, "message": "no drop"},
+            return_value={
+                "ok": False,
+                "motor_activated": False,
+                "failure_reason": "sensor_unavailable",
+                "message": "No motor pulse was started.",
+            },
         ) as vend, patch.object(
             poller,
             "complete_vend_job",
@@ -366,7 +374,11 @@ class TestVendReportSurvivesCloudError(unittest.TestCase):
         with patch.object(poller, "call_verified_vend") as vend_again, patch.object(
             poller,
             "complete_vend_job",
-            return_value={"status": "FAILED", "payment_action": "CANCELLED"},
+            return_value={
+                "status": "FAILED",
+                "payment_action": "CANCELLED",
+                "inventory_status": "recorded",
+            },
         ) as complete:
             poller.handle_vend_job(self._job())
 
@@ -394,7 +406,11 @@ class TestVendReportSurvivesCloudError(unittest.TestCase):
         with patch.object(poller, "call_verified_vend") as vend_again, patch.object(
             poller,
             "complete_vend_job",
-            return_value={"status": "SUCCESS", "payment_action": "CAPTURED"},
+            return_value={
+                "status": "SUCCESS",
+                "payment_action": "CAPTURED",
+                "inventory_status": "recorded",
+            },
         ) as complete:
             self.assertFalse(poller.flush_vend_report())
 
@@ -656,6 +672,7 @@ class TestVendReportSurvivesCloudError(unittest.TestCase):
                 "status": "SUCCESS",
                 "payment_action": "CAPTURED",
                 "payment_status": "captured",
+                "inventory_status": "recorded",
             }
 
         with patch.object(
@@ -720,7 +737,12 @@ class TestVendReportSurvivesCloudError(unittest.TestCase):
             "call_verified_vend",
             side_effect=[
                 self._dropped(),
-                {"ok": False, "failure_reason": "no_drop", "message": "no drop"},
+                {
+                    "ok": False,
+                    "motor_activated": False,
+                    "failure_reason": "sensor_unavailable",
+                    "message": "No motor pulse was started.",
+                },
             ],
         ) as vend, patch.object(
             poller, "complete_vend_job", side_effect=_keep
@@ -737,6 +759,43 @@ class TestVendReportSurvivesCloudError(unittest.TestCase):
         self.assertFalse(items[1]["ok"])
         self.assertEqual(items[0]["unit_id"], "job-1:1")
         self.assertEqual(items[1]["unit_id"], "job-1:2")
+        self.assertEqual(items[1]["outcome"], "not_dispensed")
+
+    def test_pulse_without_drop_confirmation_is_unknown(self):
+        posted = {}
+
+        def _keep(**kwargs):
+            posted.update(kwargs)
+            return {
+                "status": "FAILED",
+                "payment_status": "unresolved",
+                "payment_recovery": "pi",
+                "inventory_status": "pending",
+            }
+
+        with patch.object(
+            poller,
+            "call_verified_vend",
+            return_value={
+                "ok": False,
+                "motor_activated": True,
+                "verified": False,
+                "failure_reason": "tof_timeout",
+                "message": "No ToF drop detected after motor pulse",
+            },
+        ) as vend, patch.object(
+            poller, "complete_vend_job", side_effect=_keep
+        ):
+            poller.handle_vend_job(self._job())
+            vend.reset_mock()
+            poller.handle_vend_job(self._job())
+
+        vend.assert_not_called()
+        item = posted["result"]["items"][0]
+        self.assertEqual(item["outcome"], "unknown")
+        self.assertNotIn("ok", item)
+        self.assertTrue(item["motor_activated"])
+        self.assertIsNotNone(poller.load_vend_report())
 
     def test_restart_during_motor_request_keeps_prior_unit_unknown(self):
         poller.save_vend_report(
@@ -838,6 +897,7 @@ class TestVendReportSurvivesCloudError(unittest.TestCase):
             "status": "SUCCESS",
             "payment_action": "CAPTURED",
             "payment_status": "captured",
+            "inventory_status": "recorded",
             "physical_outcome": "partial",
             "captured_amount_cents": 250,
             "delivered_units": [result["items"][0]],
